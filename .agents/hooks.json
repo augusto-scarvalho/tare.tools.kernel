@@ -1,0 +1,28 @@
+{
+  "tare-specgraph-first": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command|grep_search|write_to_file|replace_file_content|multi_replace_file_content",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "tare-hook agy --event pre",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "write_to_file|replace_file_content|multi_replace_file_content",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "tare-hook agy --event post",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

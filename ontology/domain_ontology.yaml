@@ -1,0 +1,90 @@
+version: "1.2.0"
+governance: "SPEC-KERNEL-001"
+last_updated: "2026-11-03"
+
+concepts:
+  - id: "FivePlaneBoundary"
+    name: "Five-Plane Microkernel Boundary"
+    domain: "Runtime Architecture"
+    governing_spec: "SPEC-KERNEL-001"
+    definition: "Partition of the runtime into control, compute, data, assurance and experience planes, where a compute adapter reaches credentials, network or the data plane only through control-plane policy."
+    invariants:
+      - "A compute adapter never holds network credentials or a direct data-plane handle without a control-plane grant."
+      - "Cross-plane calls are explicit interfaces; no plane imports another plane's internals."
+    relationships:
+      governs: ["ControlPlane", "ComputePlane", "DataPlane", "AssurancePlane", "ExperiencePlane"]
+      requires: ["CASPersistence", "HermeticSandbox"]
+
+  - id: "MonotonicLeaseControl"
+    name: "Monotonic Lease Control"
+    domain: "Control Plane & State Machines"
+    governing_spec: "SPEC-KERNEL-001"
+    definition: "Control-plane protocol in which a session, train or worker holds work only under a lease with a monotonic fencing token, and a state-machine transition is valid only while the lease is current."
+    invariants:
+      - "A stale lease holder cannot advance the state machine; its writes are rejected by the fencing token."
+      - "Lease expiry is observable state, never inferred from wall-clock guesses inside the worker."
+    relationships:
+      governs: ["SessionLifecycle", "TrainStateMachine"]
+      requires: ["CASPersistence"]
+      mitigates: ["SplitBrain", "ZombieWorkers"]
+
+  - id: "CASPersistence"
+    name: "Compare-And-Swap Single-Writer Persistence"
+    domain: "Storage & Concurrency"
+    governing_spec: "SPEC-KERNEL-001"
+    definition: "Atomic state transition using an expected version and an affected-row assertion so concurrent writers cannot silently overwrite one another."
+    invariants:
+      - "A state transition succeeds only when the observed version equals the expected version."
+      - "A zero-row or multi-row update is a failed transition, never a successful write."
+    relationships:
+      mitigates: ["SplitBrain", "LostUpdates", "RaceConditions"]
+      requires: ["DurableStateStore"]
+
+  - id: "HermeticSandbox"
+    name: "Honest Execution Isolation Boundary"
+    domain: "Compute & Execution Plane"
+    governing_spec: "SPEC-KERNEL-001"
+    definition: "Execution boundary that reports and enforces only the filesystem, process, environment, credential and network isolation mechanisms actually active on the host."
+    invariants:
+      - "Unavailable isolation mechanisms must be reported explicitly and must never be presented as active."
+      - "Credentials and inherited environment are restricted to the declared execution allowlist."
+    relationships:
+      mitigates: ["HostTampering", "SecretLeakage", "EgressPoisoning"]
+      produces: ["ExecutionIsolationReceipt"]
+
+  - id: "QualifiedLinkedWorktree"
+    name: "Qualified Linked Worktree"
+    domain: "Compute & Execution Plane"
+    governing_spec: "SPEC-KERNEL-001"
+    definition: "Isolated Git worktree created from a pinned base commit with an isolated Git configuration, in which a candidate is produced and later admitted by content hash rather than by branch name."
+    invariants:
+      - "The worktree base commit is recorded before any edit; a candidate is identified by commit and SHA-256, never by branch position."
+      - "Global and system Git configuration are ignored inside the worktree; required settings are passed explicitly."
+    relationships:
+      governs: ["CandidateProduction", "WorkspaceLifecycle"]
+      requires: ["HermeticSandbox"]
+      produces: ["CandidateCommit"]
+
+  - id: "ToolHookMediation"
+    name: "Canonical Tool Hook Mediation"
+    domain: "Compute & Execution Plane"
+    governing_spec: "SPEC-KERNEL-001"
+    definition: "Interception of every tool call made by an agent runtime (Claude Code, Codex, Antigravity) by a kernel-owned hook that authorizes, denies or annotates the call before it executes, with the same policy regardless of vendor CLI."
+    invariants:
+      - "A tool call that bypasses the hook is not a mediated call; the vendor CLI never becomes the policy authority."
+      - "Denial reasons are returned to the agent verbatim so the runtime can adapt instead of retrying blindly."
+    relationships:
+      governs: ["SubagentGate", "LocalModelsFirstGate", "WriteAuthorization"]
+      requires: ["HermeticSandbox"]
+
+  - id: "ExecutionReceiptAttestation"
+    name: "Cryptographic Execution Receipt"
+    domain: "Assurance Plane"
+    governing_spec: "SPEC-KERNEL-001"
+    definition: "Identity-bound receipt attached to execution output carrying the SHA-256 digest of the artifact, the observed model or endpoint, the isolation actually applied and the verifiers that ran."
+    invariants:
+      - "Output without a receipt is unverified output; exit code zero alone never constitutes evidence."
+      - "The receipt names the observed model and endpoint, not the requested one."
+    relationships:
+      governs: ["VerificationReceipt", "AdmissionEvidence"]
+      requires: ["HermeticSandbox", "QualifiedLinkedWorktree"]

@@ -1,0 +1,14 @@
+LitJev
+Copyright 2026 ZhengxuYu
+
+LitJev: A JEV-like Decision Layer for Off-the-Shelf LLMs.
+Developed by ZhengxuYu (https://github.com/zhengxuyu).
+
+This is an independent research project, not affiliated with or endorsed by
+TypeSafe AI. It implements a hypothesis informed by public information, not
+the official Jev implementation.
+
+Portions of the Doom, chess, and film examples are adapted from jevlike:
+Copyright (c) 2026 Minimal Labs, MIT License.
+https://github.com/vinnylarouge/jevlike
+See THIRD_PARTY_NOTICES.md and THIRD_PARTY_LICENSES/jevlike-MIT.txt.

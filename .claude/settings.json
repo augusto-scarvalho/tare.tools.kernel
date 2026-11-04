@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Grep|Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "tare-hook claude",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "tare-hook claude",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

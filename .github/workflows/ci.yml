@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, dev ]
+  pull_request:
+    branches: [ main, dev ]
+
+permissions:
+  contents: read
+
+env:
+  RUNTIME_REVISION: ab2cce3b3b7d06c8bc83514b9bae0edc8b2af5c2
+  SPECGRAPH_REVISION: 10ae4d21fa69efa7e5903e5b214f17b2953ad359
+
+jobs:
+  test:
+    name: Microkernel Planes & Invariants (${{ matrix.platform }})
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-host
+            runner: '["self-hosted","Windows"]'
+            python: python
+            invoke: '&'
+          - platform: linux-wsl2
+            runner: '["self-hosted","Linux","wsl2"]'
+            python: python3
+            invoke: ''
+    runs-on: ${{ fromJSON(matrix.runner) }}
+    timeout-minutes: 20
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Prepare pinned SpecGraph and isolated Linux environment
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          GIT_TERMINAL_PROMPT: '0'
+          GCM_INTERACTIVE: Never
+        run: |
+          set -euo pipefail
+          dependency_dir="$RUNNER_TEMP/kernel-specgraph-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$dependency_dir"
+          git init "$dependency_dir/specgraph"
+          git -C "$dependency_dir/specgraph" remote add origin https://github.com/augusto-scarvalho/tare.tools.specgraph.git
+          git -C "$dependency_dir/specgraph" fetch --depth=1 origin "$SPECGRAPH_REVISION"
+          git -C "$dependency_dir/specgraph" checkout --detach FETCH_HEAD
+          test "$(git -C "$dependency_dir/specgraph" rev-parse HEAD)" = "$SPECGRAPH_REVISION"
+          git init "$dependency_dir/runtime"
+          git -C "$dependency_dir/runtime" remote add origin https://github.com/augusto-scarvalho/tare.tools.agent-runtime.git
+          git -C "$dependency_dir/runtime" fetch --depth=1 origin "$RUNTIME_REVISION"
+          git -C "$dependency_dir/runtime" checkout --detach FETCH_HEAD
+          test "$(git -C "$dependency_dir/runtime" rev-parse HEAD)" = "$RUNTIME_REVISION"
+          echo "CI_RUNTIME=$dependency_dir/runtime" >> "$GITHUB_ENV"
+          python3 -m venv "$dependency_dir/venv"
+          echo "CI_PYTHON=$dependency_dir/venv/bin/python" >> "$GITHUB_ENV"
+          echo "CI_SPECGRAPH=$dependency_dir/specgraph" >> "$GITHUB_ENV"
+          echo "$dependency_dir/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Prepare pinned SpecGraph and isolated Windows environment
+        if: runner.os == 'Windows'
+        env:
+          GIT_TERMINAL_PROMPT: '0'
+          GIT_SSH_COMMAND: 'C:/Windows/System32/OpenSSH/ssh.exe -F C:/ProgramData/tare-tools/ci/ssh_config'
+        run: |
+          $dependencyDir = Join-Path $env:RUNNER_TEMP "kernel-specgraph-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          New-Item -ItemType Directory -Force $dependencyDir | Out-Null
+          $checkout = Join-Path $dependencyDir 'specgraph'
+          git init $checkout
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C $checkout remote add origin git@tare-os-ci-specgraph:augusto-scarvalho/tare.tools.specgraph.git
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C $checkout fetch --depth=1 origin $env:SPECGRAPH_REVISION
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C $checkout checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $actualRevision = git -C $checkout rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $actualRevision -ne $env:SPECGRAPH_REVISION) { throw 'SpecGraph revision mismatch' }
+          $runtime = Join-Path $dependencyDir 'runtime'
+          git init $runtime
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C $runtime remote add origin git@tare-os-ci-agent-runtime:augusto-scarvalho/tare.tools.agent-runtime.git
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C $runtime fetch --depth=1 origin $env:RUNTIME_REVISION
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C $runtime checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $actualRuntime = git -C $runtime rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $actualRuntime -ne $env:RUNTIME_REVISION) { throw 'Runtime revision mismatch' }
+          "CI_RUNTIME=$runtime" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          python -m venv (Join-Path $dependencyDir 'venv')
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "CI_PYTHON=$dependencyDir/venv/Scripts/python.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CI_SPECGRAPH=$checkout" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$dependencyDir/venv/Scripts" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install candidate and pinned integration dependency
+        run: >-
+          ${{ matrix.invoke }} "${{ env.CI_PYTHON }}" -m pip install
+          -e ".[dev,live-cache,attachments]" "${{ env.CI_SPECGRAPH }}" "${{ env.CI_RUNTIME }}"
+
+      - name: Validate required modules without optional integration skips
+        run: >-
+          ${{ matrix.invoke }} "${{ env.CI_PYTHON }}" -c
+          "import assurance_plane, compute_plane, control_plane, data_plane, experience_plane;
+          import specgraph.hook_context, specgraph.lifecycle; print('Kernel and pinned SpecGraph loaded')"
+
+      - name: Install pinned ripgrep for real capability tests
+        run: >-
+          ${{ matrix.invoke }} "${{ env.CI_PYTHON }}" tools/install_test_ripgrep.py
+
+      - name: Run invariant suite
+        run: >-
+          ${{ matrix.invoke }} "${{ env.CI_PYTHON }}" -m pytest tests/ -q
+          --junitxml=kernel-${{ matrix.platform }}.xml
+
+      - name: Upload test receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-tests-${{ matrix.platform }}
+          path: kernel-${{ matrix.platform }}.xml
+          if-no-files-found: warn

@@ -1,0 +1,63 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.specgraph/
+
+# Local credentials and private working material (never publication inputs)
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.local.env
+/.aws/
+/.ssh/
+/.secrets/
+/.credentials/
+/.private/
+/.internal/
+/.reconciliation/
+credentials.local.*
+id_rsa
+id_ed25519
+*.p12
+*.pfx
+.claude/settings.local.json
+.aider*
+
+# SQLite runtime sidecars can contain the same private data as the database
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
+
+# Regenerable local tool state
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Private records stay in local custody; see docs/RECORDS_ARCHIVE.json.
+/docs/evidence/2026-09-09-bedrock-recovery/
+/docs/evidence/2026-09-09-http-executor/
+/docs/HTTP_QUALIFICATION_20260909.md
+/docs/NATIVE_CANARY_20260910.md
+/docs/NATIVE_DURABLE_ATTEMPT_20260910.md
+/docs/NATIVE_WORK_CAPABILITIES_20260910.md
+/docs/NATIVE_WORK_CONTEXT_20260910.md
+/docs/STRANDS_EX01_20260910.md
+/docs/NATIVE_MODEL_ADAPTERS.md
+
+# Guides for removed drivers are historical records.
+/docs/MANAGED_AIDER.md
+/docs/MANAGED_HTTP.md
+/docs/MANAGED_PROVIDER_RETRIES.md

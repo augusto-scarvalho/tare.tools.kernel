@@ -1,0 +1,77 @@
+#!/bin/sh
+set -eu
+
+remote_name=${1:-origin}
+repo_root=$(git rev-parse --show-toplevel)
+checker="$repo_root/tools/changelog_guard.py"
+zero_sha=0000000000000000000000000000000000000000
+result=0
+
+python_bin=
+python_arg=
+
+if [ -n "${PYTHON:-}" ] && "$PYTHON" -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' >/dev/null 2>&1; then
+    python_bin=$PYTHON
+elif command -v python >/dev/null 2>&1 && python -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' >/dev/null 2>&1; then
+    python_bin=python
+elif command -v python3 >/dev/null 2>&1 && python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' >/dev/null 2>&1; then
+    python_bin=python3
+elif command -v py >/dev/null 2>&1 && py -3 -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' >/dev/null 2>&1; then
+    python_bin=py
+    python_arg=-3
+else
+    echo "changelog guard: Python 3.10 or newer is required; set PYTHON to an executable path" >&2
+    exit 2
+fi
+
+run_checker() {
+    if [ -n "$python_arg" ]; then
+        "$python_bin" "$python_arg" "$checker" "$1" "$2" --repo "$repo_root"
+    else
+        "$python_bin" "$checker" "$1" "$2" --repo "$repo_root"
+    fi
+}
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    # The branch being updated decides, not the local name: `git push origin HEAD:main` from a detached
+    # worktree has local_ref HEAD and must still be checked and watched.
+    case "$remote_ref" in
+        refs/heads/*) ;;
+        *) continue ;;
+    esac
+    [ "$local_sha" != "$zero_sha" ] || continue
+
+    base_sha=$remote_sha
+    if [ "$remote_sha" = "$zero_sha" ] || ! git cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
+        remote_head=$(git symbolic-ref --quiet --short "refs/remotes/$remote_name/HEAD" 2>/dev/null || true)
+        if [ -n "$remote_head" ]; then
+            base_sha=$(git merge-base "$local_sha" "$remote_head" 2>/dev/null || printf '%s' "$zero_sha")
+        else
+            base_sha=$zero_sha
+        fi
+    fi
+
+    run_checker "$base_sha" "$local_sha" || result=1
+    [ "$remote_ref" != refs/heads/main ] || pushes_main=1
+    pushed="${pushed:-} $local_sha"
+done
+
+# Every pushed commit gets a detached CI watcher (`tare ci watch`): a red run becomes an alert that agents
+# are shown before they can end a turn, plus a Windows notification. Machines without the product skip it.
+tare_cmd="${LOCALAPPDATA:-}/tare.tools/product/tare.cmd"
+if [ "$result" = 0 ] && [ -n "${LOCALAPPDATA:-}" ] && [ -f "$tare_cmd" ] && command -v powershell.exe >/dev/null 2>&1; then
+    for sha in ${pushed:-}; do
+        powershell.exe -NoProfile -Command "Start-Process -WindowStyle Hidden -FilePath '$tare_cmd' \
+-ArgumentList 'ci','watch','$repo_root','$sha'" >/dev/null 2>&1 || true
+    done
+fi
+
+# The build machine (the only one with a Tare-Publish task) publishes a product release right after a push of
+# main. Git has no post-push hook: a detached process starts the task once this push has had time to land.
+if [ "$result" = 0 ] && [ "${pushes_main:-0}" = 1 ] && command -v schtasks.exe >/dev/null 2>&1 \
+        && schtasks.exe //Query //TN Tare-Publish >/dev/null 2>&1; then
+    powershell.exe -NoProfile -Command "Start-Process -WindowStyle Hidden powershell -ArgumentList \
+'-NoProfile','-Command','Start-Sleep 15; Start-ScheduledTask Tare-Publish'" >/dev/null 2>&1 || true
+fi
+
+exit "$result"
