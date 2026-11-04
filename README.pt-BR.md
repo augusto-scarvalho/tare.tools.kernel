@@ -82,13 +82,16 @@ git clone https://github.com/augusto-scarvalho/tare.tools.kernel.git
 cd tare.tools.kernel
 python -m venv .venv
 . .venv/bin/activate            # Windows PowerShell: .venv\Scripts\Activate.ps1
-python -m pip install "git+https://github.com/augusto-scarvalho/tare.tools.agent-runtime@ab2cce3b3b7d06c8bc83514b9bae0edc8b2af5c2"
-python -m pip install "git+https://github.com/augusto-scarvalho/tare.tools.specgraph@10ae4d21fa69efa7e5903e5b214f17b2953ad359"
+python -m pip install "git+https://github.com/augusto-scarvalho/tare.tools.agent-runtime@133d9bba5c584c1959595a50e86430670bf666f2"
+python -m pip install "git+https://github.com/augusto-scarvalho/tare.tools.specgraph@cce9edde05950bfcce980a1634f974d48308437c"
 python -m pip install -e ".[dev,attachments,live-cache]"
 python -m pytest tests/ -q
 ```
 
 Os testes rodam offline: não chamam nenhum provedor de modelo e não baixam nada.
+A CI roda esses mesmos comandos em runners Linux e Windows hospedados pelo GitHub. Para
+rodá-los nas suas próprias máquinas, defina as variáveis de repositório `CI_RUNNER_LINUX`
+e `CI_RUNNER_WINDOWS` com uma lista de labels de runner (por exemplo `["self-hosted","Linux"]`).
 As regras para quem contribui estão em [AGENTS.md](AGENTS.md).
 
 ---
