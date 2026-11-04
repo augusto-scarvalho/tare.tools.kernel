@@ -225,8 +225,10 @@ def test_wait_for_exit_waits_past_progress_and_preserves_failure(setup):
 
 def test_default_read_returns_on_first_output(setup):
     _,_,_,tools,control,_=setup
+    # The child outlives the read by far (terminal_stop ends it): a loaded runner that starts the read late must
+    # still find it running.
     started=call(tools,control,'terminal_start',repository='project',argv=[sys.executable,'-u','-c',
-        'import time; print("progress",flush=True); time.sleep(1)'])
+        'import time; print("progress",flush=True); time.sleep(60)'])
     handle=json.loads(started.output_json)['handle']
     result=call(tools,control,'terminal_read',handle=handle,wait_ms=2000)
     payload=json.loads(result.output_json)
