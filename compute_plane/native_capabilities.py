@@ -71,12 +71,15 @@ TOOL_SPECS = {
          'sha256': SHA256}, ['repository', 'path']),
     'edit': _schema('Apply an exact unique replacement using the 64 lowercase hexadecimal SHA-256 returned by read. '
         'For a missing file pass JSON null. Empty search appends. '
+        'To delete an existing file, pass delete=true, changes=[], and its current non-null SHA-256; '
+        'deletion returns sha256=null. Omit delete or pass false for replacements. '
         'Supply changes even for one replacement: a list of 1 to 16 search/replace pairs applied in order '
         'in memory, then committed once with one SHA check. A file and hash alone are not an edit; use read to inspect. '
         'Wait for the resulting SHA before the next edit; never reuse a stale SHA. '
         'Finish other edits and checks before changing pinned AGENTS.md instructions; a new conversation is needed to adopt them.',
         {'repository': TEXT, 'path': TEXT, 'sha256': {**SHA256, 'type': ['string', 'null']},
-         'changes': {'type': 'array', 'minItems': 1, 'maxItems': 16,
+         'delete': {'type': 'boolean', 'default': False},
+         'changes': {'type': 'array', 'minItems': 0, 'maxItems': 16,
                      'items': {'type': 'object', 'properties': {'search': TEXT, 'replace': TEXT},
                                'required': ['search', 'replace'], 'additionalProperties': False}}},
         ['repository', 'path', 'sha256', 'changes']),
@@ -336,7 +339,7 @@ class NativeCapabilities:
     def _before_edit(self, args, new, pre_context, effects):
         from .native_review import digest
         self._receipts.save(self._request, edit={
-            'after': digest(new.encode()), 'effects': effects, 'pre_context': pre_context})
+            'after': digest(None if new is None else new.encode()), 'effects': effects, 'pre_context': pre_context})
 
     def recover_effect(self, journal):
         from .native_effect_recovery import pending
@@ -391,7 +394,8 @@ class NativeCapabilities:
                     'accepted ' + ', '.join(sorted(schema['properties']))) if part))
             for key, value in args.items():
                 kind = schema['properties'][key]['type']
-                if (kind == 'integer' and type(value) is not int or
+                if (kind == 'boolean' and type(value) is not bool or
+                    kind == 'integer' and type(value) is not int or
                     kind == 'string' and not isinstance(value, str) or
                     isinstance(kind, list) and value is not None and not isinstance(value, str)):
                     raise ValueError('capability_argument_type')

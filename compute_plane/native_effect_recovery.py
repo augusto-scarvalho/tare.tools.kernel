@@ -106,18 +106,24 @@ class EffectReceipts:
             path = receipt_path(review_root, request.effect_id)
             if path.exists():
                 row = read_json(path)
+                deleting = (args.get('delete') is True and args.get('changes') == []
+                            and 'search' not in args and 'replace' not in args
+                            and isinstance(args.get('sha256'), str)
+                            and re.fullmatch('[0-9a-f]{64}', args['sha256']) is not None)
+                after_valid = (row.get('after') is None if deleting else
+                               isinstance(row.get('after'), str)
+                               and re.fullmatch('[0-9a-f]{64}', row['after']) is not None)
                 if (row.get('schema') != 'tare.tools/edit-review/1' or row.get('effect_id') != request.effect_id
                         or any(row.get(k) != args[k] for k in ('repository', 'path'))
                         or row.get('before') != args['sha256']
-                        or not isinstance(row.get('after'), str)
-                        or re.fullmatch('[0-9a-f]{64}', row['after']) is None
+                        or 'after' not in row or not after_valid
                         or row['before'] is not None and (not isinstance(row['before'], str)
                             or re.fullmatch('[0-9a-f]{64}', row['before']) is None)):
                     raise ValueError('Edit review receipt does not match the interrupted request.')
                 before = capture(review_root / 'blobs' / row['before']) if row['before'] else None
-                after = capture(review_root / 'blobs' / row['after'])
+                after = None if deleting else capture(review_root / 'blobs' / row['after'])
                 if (digest(before) != row['before'] or digest(after) != row['after']
-                        or tools.edited_text((before or b'').decode(), args).encode() != after):
+                        or not deleting and tools.edited_text((before or b'').decode(), args).encode() != after):
                     raise ValueError('Edit review snapshots do not prove this replacement.')
                 self.check_file(tools, args, row['after'])
                 return EffectResult(request.effect_id, 'succeeded', encode({

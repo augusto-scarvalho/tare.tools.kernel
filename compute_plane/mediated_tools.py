@@ -72,8 +72,7 @@ SCHEMAS = {
              "json_pointer": "optional JSON pointer", "json_fields": "comma-separated relative JSON pointers",
              "offset": "JSON page offset", "limit": "up to 100 JSON items"},
     "resolve": {"repository": "id", "query": "literal query"},
-    "edit": {"repository": "id", "path": "relative file", "sha256": "latest read hash or null for new", "search": "old text", "replace": "new text", "changes": "1 to 16 search/replace pairs, instead of search/replace"},
-    "delete": {"repository": "id", "path": "relative file", "sha256": "latest hash"},
+    "edit": {"repository": "id", "path": "relative file", "sha256": "latest read hash or null for new", "search": "old text", "replace": "new text", "changes": "1 to 16 search/replace pairs, instead of search/replace", "delete": "boolean: true requires changes=[] and current non-null sha256"},
     "rename": {"repository": "id", "path": "relative source", "sha256": "latest hash", "target": "new relative path"},
     "run": {"repository": "id", "argv": "argument string list; explicit execution permission required"},
     "verify": {"name": "configured verification name"},
@@ -127,7 +126,7 @@ class MediatedTools:
         if self.config["role"] == "auditor" and self.config.get("verifiers"):
             names.add("verify")
         if self.config["role"] == "implementer":
-            names |= {"edit", "delete", "rename", "verify"}
+            names |= {"edit", "rename", "verify"}
             if self.config.get("allow_exec"):
                 names.add("run")
         if self.config.get('admitted_capabilities') is not None:
@@ -322,7 +321,7 @@ class MediatedTools:
             path = io_path(self.path(repo, args.get("path", "."), directory=True))
             names = sorted(item.name + ("/" if item.is_dir() else "") for item in path.iterdir() if item.name != ".git")
             return {"entries": names[:200], "truncated": len(names) > 200}
-        path = io_path(self.path(repo, args["path"], write=name in {"edit", "delete", "rename"}))
+        path = io_path(self.path(repo, args["path"], write=name in {"edit", "rename"}))
         if name == "read":
             if ('json_pointer' in args and any(k in args for k in ('start', 'end', 'start_column')) or
                     'json_pointer' not in args and any(k in args for k in ('json_fields', 'offset'))):
@@ -399,6 +398,14 @@ class MediatedTools:
                     'requested_end': requested_end,
                     'truncated': actual_end < min(requested_end, len(lines)),
                     'next_start': actual_end+1 if actual_end < len(lines) else None}
+        deleting = name == 'edit' and args.get('delete', False) is True
+        if name == 'edit' and 'delete' in args and type(args['delete']) is not bool:
+            raise ValueError('delete_requires_boolean')
+        if deleting:
+            if args.get('sha256') is None or args.get('sha256') == 'null':
+                raise ValueError('delete_requires_sha256')
+            if args.get('changes') != [] or 'search' in args or 'replace' in args:
+                raise ValueError('delete_requires_empty_changes')
         if args.get("sha256") == "null":
             # Tool-call formats that carry every argument as text (Qwen's XML form) cannot send JSON null;
             # "null" is never a hash, so it can only mean "this file does not exist yet".
@@ -411,7 +418,7 @@ class MediatedTools:
         observed = self.observed(repo, args["path"])
         if observed != args["sha256"]:
             raise ValueError("source_changed_read_again")
-        if name != "edit" and observed is None:
+        if (name != "edit" or deleting) and observed is None:
             raise ValueError("source_missing")
         target = io_path(self.path(repo, args["target"], write=True)) if name == "rename" else None
         if target is not None and target.exists():
@@ -426,7 +433,7 @@ class MediatedTools:
             target_pre = evaluate(ToolCall(self.config.get("host", "aider"), "PreToolUse", "write", {"file_path": args["target"]}, str(root)))
             if target_pre.decision is ToolDecision.DENY:
                 raise ValueError(target_pre.reason)
-        if name == "edit":
+        if name == "edit" and not deleting:
             old = path.read_bytes().decode("utf-8") if observed else ""
             new = self.edited_text(old, args)
             if len(new.encode()) > 2 * 1024 * 1024:
@@ -455,8 +462,14 @@ class MediatedTools:
                 os.replace(temporary, path)
             finally:
                 Path(temporary).unlink(missing_ok=True)
-        elif name == "delete":
+        elif deleting:
+            if self.observed(repo, args['path']) != observed:
+                raise ValueError('source_changed_before_write')
             self.before_effect()
+            if self.before_edit is not None:
+                self.before_edit(args, None, pre.additional_context, self.effects + 1)
+            if self.observed(repo, args['path']) != observed:
+                raise ValueError('source_changed_before_unlink')
             path.unlink()
         elif name == "rename":
             self.before_effect()
@@ -465,6 +478,8 @@ class MediatedTools:
         else:
             raise ValueError("unknown_capability")
         self.effects += 1
+        if deleting:
+            self.reads.pop(repo + ':' + args['path'], None)
         self.verifications.clear()
         self._source_hashes[repo + ':' + args['path']] = self.observed(repo, args['path'])
         self.written.add(repo + ":" + args["path"])

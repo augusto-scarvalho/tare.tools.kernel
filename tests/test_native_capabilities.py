@@ -92,12 +92,14 @@ def test_long_repository_paths_keep_scope_hashes_and_file_operations(tmp_path):
                              'search':'value = 1\n','replace':'value = 2\n'})
     assert source.read_bytes()==b'value = 2\r\n'
     with pytest.raises(ValueError,match='source_changed_read_again'):
-        tools.perform('delete',{'repository':'repo','path':name,'sha256':read['sha256']})
+        tools.perform('edit',{'repository':'repo','path':name,'sha256':read['sha256'],
+                              'changes':[], 'delete':True})
     with pytest.raises(ValueError,match='outside_writable_scope'):
         tools.perform('rename',{'repository':'repo','path':name,'sha256':edit['sha256'],'target':'outside.txt'})
     tools.perform('rename',{'repository':'repo','path':name,'sha256':edit['sha256'],'target':target})
     assert not source.exists() and io_path(root/target).read_bytes()==b'value = 2\r\n'
-    tools.perform('delete',{'repository':'repo','path':target,'sha256':edit['sha256']})
+    tools.perform('edit',{'repository':'repo','path':target,'sha256':edit['sha256'],
+                          'changes':[], 'delete':True})
     assert not io_path(root/target).exists()
 
 
@@ -588,3 +590,123 @@ def test_protected_command_invalid_argv_never_reaches_mediation(setup,argv):
     tools.bind_command_mediation(Never());tools.bind_command_confinement(lambda *a,**kw:None,{},10)
     result=call(tools,control,'command',repository='repo',argv=argv)
     assert result.status=='refused' and json.loads(result.output_json)['reason']=='protected_command_argv_invalid'
+
+
+def test_delete_is_not_a_standalone_capability(setup):
+    from compute_plane.mediated_tools import MediatedTools, SCHEMAS
+    from compute_plane.native_capabilities import TOOL_SPECS
+    root, _, tools, control = setup
+    assert 'delete' not in SCHEMAS
+    assert 'delete' not in tools._tools.schemas()
+    assert 'delete' not in TOOL_SPECS
+    assert 'delete' not in tools.names
+    specs = json.loads(tools.tool_specs_json)
+    assert 'delete' not in specs
+    edit = specs['edit']
+    assert edit['parameters']['properties']['delete']['type'] == 'boolean'
+    assert 'delete=true, changes=[]' in edit['description']
+    assert 'current non-null SHA-256' in edit['description']
+    config = dict(role='implementer', repositories={'repo': str(root)},
+                  writable={'repo': ['a.py']}, specgraph_edit_context=False)
+    with pytest.raises(ValueError, match='invalid_admitted_capabilities'):
+        MediatedTools(config | {'admitted_capabilities': ['edit', 'delete']})
+
+
+def test_standalone_delete_is_refused_without_effects(setup):
+    root, _, tools, control = setup
+    before = (root/'a.py').read_bytes()
+    args = dict(repository='repo', path='a.py', sha256=hashlib.sha256(before).hexdigest())
+    hooks = []
+    tools._tools.before_effect = lambda: hooks.append('before_effect')
+    tools._tools.before_edit = lambda *args: hooks.append('before_edit')
+    tools._tools.callbacks['delete'] = lambda **args: hooks.append('callback')
+    with pytest.raises(ValueError, match='capability_or_arguments_not_admitted:delete'):
+        tools._tools.perform('delete', args)
+    assert call(tools, control, 'delete', **args).status == 'refused'
+    assert not hooks
+    assert tools._tools.effects == 0
+    assert not tools._tools.written
+    assert (root/'a.py').read_bytes() == before
+
+
+def test_edit_delete_lifecycle(setup):
+    from jsonschema import Draft202012Validator
+    root, _, tools, control = setup
+    args = dict(repository='repo', path='a.py')
+    sha = json.loads(call(tools, control, 'read', **args).output_json)['sha256']
+    tools._tools.verifications['old'] = {}
+    deletion = dict(args, sha256=sha, changes=[], delete=True)
+    assert Draft202012Validator(json.loads(tools.tool_specs_json)['edit']['parameters']).is_valid(deletion)
+    result = call(tools, control, 'edit', **deletion)
+    assert result.status == 'succeeded'
+    assert json.loads(result.output_json)['sha256'] is None
+    assert not (root/'a.py').exists()
+    assert 'repo:a.py' not in tools._tools.reads
+    assert not tools._tools.verifications
+    assert 'repo:a.py' in tools._tools.written
+    assert tools._tools.effects == 1
+    missing = call(tools, control, 'read', **args)
+    assert missing.status == 'succeeded'
+    assert json.loads(missing.output_json) == {'exists': False, 'sha256': None}
+    created = call(tools, control, 'edit', **args, sha256=None,
+                   changes=[{'search': '', 'replace': 'value = 2\n'}], delete=False)
+    assert created.status == 'succeeded'
+    assert (root/'a.py').read_bytes() == b'value = 2\n'
+    assert tools._tools.effects == 2
+
+
+@pytest.mark.parametrize('override', [
+    {'sha256': None}, {'sha256': 'null'}, {'sha256': 'bad'}, {'sha256': '0'*64},
+    {'delete': 1}, {'delete': 'true'}, {'delete': None},
+    {'changes': [{'search': '', 'replace': ''}]}, {'changes': None},
+    {'search': '', 'replace': ''}, {'delete': False}, {'path': 'outside.py'},
+])
+def test_delete_refuses_invalid_requests_without_effect(setup, override):
+    root, _, tools, control = setup
+    before = (root/'a.py').read_bytes()
+    (root/'outside.py').write_bytes(before)
+    args = dict(repository='repo', path='a.py', sha256=hashlib.sha256(before).hexdigest(),
+                changes=[], delete=True)
+    result = call(tools, control, 'edit', **(args | override))
+    assert result.status == 'refused'
+    assert (root/'a.py').read_bytes() == before
+    assert (root/'outside.py').read_bytes() == before
+    assert tools._tools.effects == 0
+
+
+def test_delete_missing_source_and_missing_changes(setup):
+    root, _, tools, control = setup
+    sha = hashlib.sha256((root/'a.py').read_bytes()).hexdigest()
+    args = dict(repository='repo', path='a.py', sha256=sha, delete=True)
+    assert call(tools, control, 'edit', **args).status == 'refused'
+    (root/'a.py').unlink()
+    assert call(tools, control, 'edit', **args, changes=[]).status == 'refused'
+    assert not (root/'a.py').exists()
+    assert tools._tools.effects == 0
+
+
+@pytest.mark.parametrize('guard', ['pre_effect', 'pre_write_sha'])
+def test_delete_pre_effect_guards_preserve_source(setup, monkeypatch, guard):
+    root, _, tools, control = setup
+    before = (root/'a.py').read_bytes()
+    args = dict(repository='repo', path='a.py', sha256=hashlib.sha256(before).hexdigest(),
+                changes=[], delete=True)
+    if guard == 'pre_effect':
+        def refused():
+            raise ValueError('pre_effect_refused')
+        monkeypatch.setattr(tools._tools, 'before_effect', refused)
+    else:
+        original = tools._tools.observed
+        calls = 0
+        def changed(*args):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                (root/'a.py').write_bytes(b'newer source\n')
+            return original(*args)
+        monkeypatch.setattr(tools._tools, 'observed', changed)
+    result = call(tools, control, 'edit', **args)
+    assert result.status == 'refused'
+    expected = before if guard == 'pre_effect' else b'newer source\n'
+    assert (root/'a.py').read_bytes() == expected
+    assert tools._tools.effects == 0
