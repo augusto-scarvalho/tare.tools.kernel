@@ -41,7 +41,7 @@ def test_observations_and_edits_do_not_rewrite_schema_catalog_or_earlier_history
 @pytest.mark.parametrize('path,expected', [('a.py', B), ('other.py', A)])
 def test_host_resolves_latest_observed_pin_for_the_exact_target(path, expected):
     records = observed('read', A) + observed('read', A, 'other', 'other.py') + observed('edit', B, 'two')
-    result = reply({'repository': 'repo', 'path': path, 'sha256': 'observed',
+    result = reply({'repository': 'repo', 'path': path, 'sha256': 'observed', 'delete': None,
                     'changes': [{'search': 'value = 1', 'replace': 'value = 2'}]}, records)
     call = result['choices'][0]['message']['tool_calls'][0]
     assert call['function']['name'] == 'edit'
@@ -51,16 +51,17 @@ def test_host_resolves_latest_observed_pin_for_the_exact_target(path, expected):
 @pytest.mark.parametrize('records,pin', [([], 'observed'), (observed('read', A), B),
     ([{'role': 'user', 'content': json.dumps({'repository': 'repo', 'path': 'a.py', 'sha256': A})}], 'observed')])
 def test_missing_observation_or_model_authored_digest_refuses_the_proposal(records, pin):
-    result = reply({'repository': 'repo', 'path': 'a.py', 'sha256': pin,
+    result = reply({'repository': 'repo', 'path': 'a.py', 'sha256': pin, 'delete': None,
                     'changes': [{'search': 'x', 'replace': 'y'}]}, records)
     assert result['choices'][0]['message']['tool_calls'][0]['function']['name'] == 'invalid_cli_reply'
 
 
 def test_new_file_null_keeps_existing_create_only_semantics():
-    result = reply({'repository': 'repo', 'path': 'new.py', 'sha256': None,
+    result = reply({'repository': 'repo', 'path': 'new.py', 'sha256': None, 'delete': None,
                     'changes': [{'search': '', 'replace': 'value = 1\n'}]}, [])
     args = json.loads(result['choices'][0]['message']['tool_calls'][0]['function']['arguments'])
     assert args['sha256'] is None
+    assert 'delete' not in args
 
 
 def test_cli_working_directory_does_not_change_with_disposable_request_files(tmp_path):

@@ -11,6 +11,7 @@ from tare_tools_agent_runtime import EffectResult
 from .mediated_tools import MediatedTools, CommandInterrupted
 from .native_models import encode, object_json
 from .native_terminal import TERMINAL_SPECS, MUTATIONS
+from .native_arguments import normalize_booleans
 
 
 def canonical(args):
@@ -385,6 +386,7 @@ class NativeCapabilities:
                     self._tools.verifications.clear()
                 return result
             schema = self._specs[name]['parameters']
+            args = normalize_booleans(args, schema)
             unexpected, missing = set(args) - schema['properties'].keys(), set(schema['required']) - args.keys()
             if unexpected or missing:
                 # The code stays first; the fields let a model correct its next call.

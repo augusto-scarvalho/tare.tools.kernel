@@ -657,7 +657,7 @@ def test_edit_delete_lifecycle(setup):
 
 @pytest.mark.parametrize('override', [
     {'sha256': None}, {'sha256': 'null'}, {'sha256': 'bad'}, {'sha256': '0'*64},
-    {'delete': 1}, {'delete': 'true'}, {'delete': None},
+    {'delete': 1}, {'delete': 'TRUE'}, {'delete': ' false'}, {'delete': ''}, {'delete': None},
     {'changes': [{'search': '', 'replace': ''}]}, {'changes': None},
     {'search': '', 'replace': ''}, {'delete': False}, {'path': 'outside.py'},
 ])
@@ -710,3 +710,54 @@ def test_delete_pre_effect_guards_preserve_source(setup, monkeypatch, guard):
     expected = before if guard == 'pre_effect' else b'newer source\n'
     assert (root/'a.py').read_bytes() == expected
     assert tools._tools.effects == 0
+
+
+@pytest.mark.parametrize('direct', [False, True])
+@pytest.mark.parametrize('delete', [True, 'true'])
+def test_qwen_text_delete_reaches_executor(setup, direct, delete):
+    root, _, tools, control = setup
+    args = dict(repository='repo', path='a.py',
+                sha256=hashlib.sha256((root/'a.py').read_bytes()).hexdigest(),
+                changes=[], delete=delete)
+    original = dict(args)
+    if direct:
+        from compute_plane.mediated_tools import MediatedTools
+        mediated = MediatedTools({'role': 'implementer', 'repositories': {'repo': str(root)},
+                                  'writable': {'repo': ['a.py']}, 'specgraph_edit_context': False})
+        output = mediated.perform('edit', args)
+    else:
+        result = call(tools, control, 'edit', **args)
+        assert result.status == 'succeeded'
+        output = json.loads(result.output_json)
+    assert output['sha256'] is None
+    assert not (root/'a.py').exists()
+    assert args == original
+    assert (mediated if direct else tools._tools).effects == 1
+
+
+@pytest.mark.parametrize('direct', [False, True])
+@pytest.mark.parametrize('delete', [False, 'false'])
+def test_text_false_edits_content_without_converting_text(setup, direct, delete):
+    root, _, tools, control = setup
+    args = dict(repository='repo', path='a.py',
+                sha256=hashlib.sha256((root/'a.py').read_bytes()).hexdigest(), delete=delete,
+                changes=[dict(search='value = 1', replace='true false')])
+    if direct:
+        from compute_plane.mediated_tools import MediatedTools
+        mediated = MediatedTools({'role': 'implementer', 'repositories': {'repo': str(root)},
+                                  'writable': {'repo': ['a.py']}, 'specgraph_edit_context': False})
+        mediated.perform('edit', args)
+    else:
+        assert call(tools, control, 'edit', **args).status == 'succeeded'
+    assert (root/'a.py').read_text() == 'true false\n'
+    assert args['delete'] == delete
+
+
+def test_boolean_normalization_is_schema_scoped_and_nonmutating():
+    from compute_plane.native_arguments import normalize_booleans
+    args = dict(flag='true', text='false', unknown='true', changes=[dict(replace='true')])
+    schema = {'properties': {'flag': {'type': 'boolean'}, 'text': {'type': 'string'}}}
+    assert normalize_booleans(args, schema) == dict(args, flag=True)
+    assert args['flag'] == 'true'
+    for value in (True, False, None, 1, [], 'TRUE', 'False', ' true', ''):
+        assert normalize_booleans({'flag': value}, schema)['flag'] is value

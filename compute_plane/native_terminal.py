@@ -5,6 +5,7 @@ import hashlib
 
 from tare_tools_agent_runtime import EffectResult
 from .terminal_host import TerminalRefused, TerminalTransportError
+from .native_arguments import normalize_booleans
 
 
 def _spec(description, properties, required):
@@ -108,6 +109,7 @@ class NativeTerminal:
             args = json.loads(request.tool_call.arguments_json)
             if name not in TERMINAL_SPECS:
                 raise ValueError('terminal_tool_not_admitted')
+            args = normalize_booleans(args, TERMINAL_SPECS[name]['parameters'])
             validate(name, args)
             if name == 'terminal_start':
                 args['request_id'] = request.effect_id

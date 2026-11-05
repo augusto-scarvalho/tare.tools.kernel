@@ -22,7 +22,7 @@ def wire(records):
     return body,parameters
 
 def edit(sha):
-    return {'repository':'repo','path':'a.py','sha256':sha,'changes':[{'search':'value = 1','replace':'value = 2'}]}
+    return {'repository':'repo','path':'a.py','sha256':sha,'delete':None,'changes':[{'search':'value = 1','replace':'value = 2'}]}
 
 def test_exact_observed_digest_is_selected_instead_of_retyped_with_a_valid_hex_typo():
     body,schema=wire(observed('read',A))

@@ -37,6 +37,7 @@ class SearchMismatch(ValueError):
                        ". Copy only the source after the first |, preserving indentation, quotes and backslashes, or use a shorter anchor.")
 from .workspace import isolated_child_environment
 from .native_journal import io_path
+from .native_review import edit_args
 
 # One explicitly named source may be larger than the directory search budget.
 # Replies remain bounded to 200 lines / 24,000 bytes, including granted-folder reads.
@@ -398,6 +399,8 @@ class MediatedTools:
                     'requested_end': requested_end,
                     'truncated': actual_end < min(requested_end, len(lines)),
                     'next_start': actual_end+1 if actual_end < len(lines) else None}
+        if name == 'edit':
+            args = edit_args(args)
         deleting = name == 'edit' and args.get('delete', False) is True
         if name == 'edit' and 'delete' in args and type(args['delete']) is not bool:
             raise ValueError('delete_requires_boolean')

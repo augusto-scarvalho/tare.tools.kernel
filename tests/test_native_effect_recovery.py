@@ -84,13 +84,14 @@ def test_edit_does_not_overwrite_changes_while_intent_is_saved(setup, monkeypatc
     assert (root/'a.py').read_text() == 'newer user change\n'
 
 
+@pytest.mark.parametrize('delete', [True, 'true'])
 @pytest.mark.parametrize('cut', ['intent', 'unlink', 'result'])
-def test_delete_recovers_without_replay(setup, monkeypatch, cut):
+def test_delete_recovers_without_replay(setup, monkeypatch, cut, delete):
     import hashlib
     root, _, tools, control = setup
     req = request('edit', repository='repo', path='a.py',
                   sha256=hashlib.sha256((root/'a.py').read_bytes()).hexdigest(),
-                  changes=[], delete=True)
+                  changes=[], delete=delete)
     original = tools._tools.before_edit
     def before(*args):
         original(*args)
@@ -114,12 +115,13 @@ def test_delete_recovers_without_replay(setup, monkeypatch, cut):
     assert (root/'a.py').read_text() == 'newer content\n'
 
 
-def test_delete_final_hash_guard(setup, monkeypatch):
+@pytest.mark.parametrize('delete', [True, 'true'])
+def test_delete_final_hash_guard(setup, monkeypatch, delete):
     import hashlib
     root, _, tools, control = setup
     req = request('edit', repository='repo', path='a.py',
                   sha256=hashlib.sha256((root/'a.py').read_bytes()).hexdigest(),
-                  changes=[], delete=True)
+                  changes=[], delete=delete)
     original = tools._tools.before_edit
     def changed(*args):
         original(*args)
@@ -132,14 +134,15 @@ def test_delete_final_hash_guard(setup, monkeypatch):
         tools.recover_effect(journal_for(req))
 
 
-def test_delete_review_snapshots_and_review_only_recovery(setup):
+@pytest.mark.parametrize('delete', [True, 'true'])
+def test_delete_review_snapshots_and_review_only_recovery(setup, delete):
     import hashlib
     from compute_plane.native_review import receipt_path
     root, scratch, tools, control = setup
     tools.review_root = scratch/'review'
     before = (root/'a.py').read_bytes()
     sha = hashlib.sha256(before).hexdigest()
-    req = request('edit', repository='repo', path='a.py', sha256=sha, changes=[], delete=True)
+    req = request('edit', repository='repo', path='a.py', sha256=sha, changes=[], delete=delete)
     assert tools.execute(req, control).status == 'succeeded'
     row = json.loads(receipt_path(tools.review_root, req.effect_id).read_text())
     assert row['before'] == sha and row['after'] is None
