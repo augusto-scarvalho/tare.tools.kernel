@@ -46,7 +46,7 @@ def test_schema_validates_the_arguments_object_and_keeps_owner_schema_unchanged(
 @pytest.mark.parametrize('name,args,expected',[
     ('read',dict(repository='projects',path='notas/ação.txt',start=None,end=None,start_column=None,sha256=None),
             dict(repository='projects',path='notas/ação.txt')),
-    ('edit',dict(repository='projects',path='new.py',sha256=None,
+    ('edit',dict(repository='projects',path='new.py',sha256=None,delete=None,
         changes=[dict(search='',replace='PATH = "C:\\files\\note"\nQUOTE = \'ação\'\n')]),
         dict(repository='projects',path='new.py',sha256=None,
         changes=[dict(search='',replace='PATH = "C:\\files\\note"\nQUOTE = \'ação\'\n')])),
@@ -110,13 +110,15 @@ def test_current_edit_requires_a_list_and_reaches_the_fenced_executor(tmp_path):
         verifiers={}, scratch_root=scratch, specgraph_edit_context=False)
     read = tools.execute(EffectRequest('s', 'read', ToolCall('r', 'read',
         json.dumps(dict(repository='repo', path='a.py')))), control)
-    args = dict(repository='repo', path='a.py', sha256=json.loads(read.output_json)['sha256'])
+    args = dict(repository='repo', path='a.py', sha256=json.loads(read.output_json)['sha256'], delete=None)
     rejected = reply([dict(name='edit', arguments=args)], {'edit': TOOL_SPECS['edit']})
     assert rejected['choices'][0]['message']['tool_calls'][0]['function']['name'] == 'invalid_cli_reply'
     assert source.read_bytes() == b'value = 1\nother = 3\n'
     args['changes'] = [dict(search='value = 1', replace='value = 2'), dict(search='other = 3', replace='other = 4')]
     output = reply([dict(name='edit', arguments=args)], {'edit': TOOL_SPECS['edit']})
     call = output['choices'][0]['message']['tool_calls'][0]
+    args = json.loads(call['function']['arguments'])
+    assert 'delete' not in args
     result = tools.execute(EffectRequest('s', 'edit', ToolCall(call['id'], call['function']['name'],
         call['function']['arguments'])), control)
     assert result.status == 'succeeded'

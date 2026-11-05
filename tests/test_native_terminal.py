@@ -280,3 +280,41 @@ def test_wait_for_exit_has_finite_deadline_despite_progress(setup,monkeypatch):
     assert elapsed==pytest.approx(.15)
     assert clock.sleeps and all(0 <= seconds <= .05 for seconds in clock.sleeps)
     assert json.loads(result.output_json)['status']=='running'
+
+
+@pytest.mark.parametrize('direct', [False, True])
+@pytest.mark.parametrize('value,expected', [(True, True), (False, False), ('true', True), ('false', False)])
+def test_terminal_boolean_arguments_match_native_values(setup, direct, value, expected):
+    _, _, _, tools, control, _ = setup
+    dispatched = []
+    class Client:
+        def request(self, operation, **args):
+            dispatched.append((operation, args))
+            if operation == 'list':
+                assert args['include_completed'] is expected
+                return []
+            stream = dict(text='progress', cursor=8, end=8, more=False, truncated=False)
+            return dict(status='running' if len(dispatched) == 1 else 'exited', exit_code=0,
+                        output={'stdout': stream, 'stderr': dict(stream)})
+    tools.terminal = NativeTerminal(session_id='s', binding=control.binding, client=Client())
+    port = tools.terminal if direct else tools
+    result = call(port, control, 'terminal_read', handle='h', wait_for_exit=value, wait_ms=1000)
+    assert result.status == 'succeeded'
+    assert len(dispatched) == (2 if expected else 1)
+    assert json.loads(result.output_json)['status'] == ('exited' if expected else 'running')
+    assert call(port, control, 'terminal_list', include_completed=value).status == 'succeeded'
+
+
+@pytest.mark.parametrize('direct', [False, True])
+@pytest.mark.parametrize('name,key', [('terminal_read', 'wait_for_exit'), ('terminal_list', 'include_completed')])
+@pytest.mark.parametrize('value', ['TRUE', 'False', ' true', '', 1, None, []])
+def test_invalid_terminal_booleans_refused_before_dispatch(setup, direct, name, key, value):
+    _, _, _, tools, control, _ = setup
+    class Client:
+        def request(self, *args, **kwargs):
+            pytest.fail('invalid arguments must not dispatch')
+    tools.terminal = NativeTerminal(session_id='s', binding=control.binding, client=Client())
+    args = {'handle': 'h'} if name == 'terminal_read' else {}
+    result = call(tools.terminal if direct else tools, control, name, **args, **{key: value})
+    assert result.status == 'refused'
+    assert json.loads(result.output_json)['reason'] == 'terminal_tool_argument_type'

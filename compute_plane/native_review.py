@@ -5,10 +5,12 @@ import tempfile
 from pathlib import Path
 
 from .native_journal import io_path, regular, save_json, _sync_directory
+from .native_arguments import normalize_booleans
 
 
 def edit_args(args):
-    """An edit's arguments as executed: "null" (Qwen's XML calls carry text) creates, like JSON null."""
+    """Interpret text-only edit arguments consistently for execution and recovery."""
+    args = normalize_booleans(args, {'properties': {'delete': {'type': 'boolean'}}})
     return {**args, 'sha256': None} if args.get('sha256') == 'null' else args
 
 
