@@ -67,10 +67,12 @@ def restore_bytes(path, before, after, *, before_write):
     The host validates authority and snapshot provenance. Recheck the current
     bytes after preparing the replacement and persisting intent. This shares
     the file tool's cooperative-lock contract; unrelated editors do not honor
-    it, so this is not an OS-wide compare-and-swap transaction.
+    it, so this is not an OS-wide compare-and-swap transaction. An `after` of
+    None undoes a deletion: the file must still be absent, and `before` returns.
     """
-    if (not isinstance(after, bytes) or before is not None and not isinstance(before, bytes)
-            or len(after) > 2 * 1024 * 1024 or before is not None and len(before) > 2 * 1024 * 1024):
+    if (after is not None and not isinstance(after, bytes) or before is not None and not isinstance(before, bytes)
+            or before is None and after is None
+            or after is not None and len(after) > 2 * 1024 * 1024 or before is not None and len(before) > 2 * 1024 * 1024):
         raise ValueError('invalid_restore_snapshot')
     path = regular(io_path(path))
     if capture(path) != after:
@@ -83,7 +85,8 @@ def restore_bytes(path, before, after, *, before_write):
                 stream.write(before)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.chmod(temporary, path.stat().st_mode)
+            if after is not None:  # a deleted file has no mode to keep; the new one gets the default
+                os.chmod(temporary, path.stat().st_mode)
         before_write()
         if capture(path) != after:
             raise ValueError('File changed before restoration; newer changes were preserved.')
