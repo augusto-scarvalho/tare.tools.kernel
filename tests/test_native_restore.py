@@ -46,3 +46,16 @@ def test_symlink_target_refused(tmp_path):
     with pytest.raises(ValueError, match='link_forbidden'):
         restore_bytes(link, b'before', b'after', before_write=lambda: None)
     assert source.read_bytes() == b'after'
+
+
+def test_undoing_a_deletion_recreates_the_file_unless_it_reappeared(tmp_path):
+    path, seen = tmp_path/'file', []
+    restore_bytes(path, b'before\r\n', None, before_write=lambda: seen.append(True))
+    assert path.read_bytes() == b'before\r\n' and seen == [True]
+    assert list(tmp_path.iterdir()) == [path]
+    path.unlink()
+    with pytest.raises(ValueError, match='changed before restoration'):
+        restore_bytes(path, b'before', None, before_write=lambda: path.write_bytes(b'new file'))
+    assert path.read_bytes() == b'new file' and list(tmp_path.iterdir()) == [path]
+    with pytest.raises(ValueError, match='invalid_restore_snapshot'):
+        restore_bytes(tmp_path/'none', None, None, before_write=lambda: None)
