@@ -107,6 +107,15 @@ another provider, or create a second runtime. NativeSession still owns tools.
   following [Anthropic's effort contract](https://platform.claude.com/docs/en/build-with-claude/effort).
   The adapter passes it unchanged; role owners choose a level before creating
   a session. It never enables thinking or changes cache controls implicitly.
+  On the last model call with `force_final_delivery=True`, `tool_choice` remains
+  `{'type': 'auto'}` when thinking is omitted (including an adaptive provider
+  default) or is not explicitly disabled. Only a profile parameter object
+  `thinking: {'type': 'disabled'}` permits forcing
+  `{'type': 'tool', 'name': 'tare_deliver'}`. Non-object thinking values do not
+  count as explicit disabling. The existing last-call budget warning is preserved;
+  the adapter never toggles thinking or changes other parameters to force delivery.
+  OpenAI Chat still forces its nested named function choice; OpenAI Responses and
+  Codex Responses still force `{'type': 'function', 'name': 'tare_deliver'}`.
 
 Anthropic usage uses the distinct `anthropic-exclusive` contract: `input_tokens`,
 `cache_read_input_tokens`, and `cache_creation_input_tokens` are disjoint input
