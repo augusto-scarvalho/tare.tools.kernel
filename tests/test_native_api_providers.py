@@ -36,6 +36,66 @@ def model(protocol, client, **kwargs):
         counter_protocol='utf8-envelope-estimate-v1', **kwargs)
 
 
+@pytest.mark.parametrize('params', [
+    {}, {'thinking': {'type': 'adaptive'}},
+    {'thinking': {'type': 'enabled', 'budget_tokens': 512}},
+    {'thinking': {'type': 'disabled'}}, {'thinking': {}},
+    *({'thinking': value} for value in [None, False, True, 'disabled', [], 0]),
+])
+def test_anthropic_final_delivery_choice_preserves_thinking_and_budget(params):
+    params = {**params, 'temperature': 0.7}
+    profile_args = {'parameters_json': json.dumps(params)}
+    req = replace(request(), remaining_model_calls=1)
+    baseline = model('anthropic-messages', Client([]), profile_args=profile_args).wire(req)
+    wire = model('anthropic-messages', Client([]), profile_args=profile_args,
+                 force_final_delivery=True).wire(req)
+    disabled = params.get('thinking') == {'type': 'disabled'}
+    expected = {'type': 'tool', 'name': 'tare_deliver'} if disabled else {'type': 'auto'}
+    assert wire['tool_choice'] == expected
+    assert wire == {**baseline, 'tool_choice': expected}
+    assert all(wire[key] == value for key, value in params.items())
+    assert ('thinking' in wire) == ('thinking' in params)
+    assert wire['messages'][-1]['content'][-1] == {'type': 'text', 'text': (
+        'Runtime budget: 1 model calls remain INCLUDING this call. '
+        'Summary calls also consume this budget. Batch independent reads or searches when useful; '
+        'reuse observed sources. Reserve calls for necessary verification and final delivery. '
+        'Do not skip checks or claim completion to fit the budget; report unfinished work honestly.')}
+
+
+@pytest.mark.parametrize('protocol,expected', [
+    ('openai-chat', {'type': 'function', 'function': {'name': 'tare_deliver'}}),
+    ('openai-responses', {'type': 'function', 'name': 'tare_deliver'}),
+    ('openai-codex-responses', {'type': 'function', 'name': 'tare_deliver'}),
+])
+def test_openai_final_delivery_keeps_named_tool(protocol, expected):
+    req = replace(request(), remaining_model_calls=1)
+    streaming = protocol == 'openai-codex-responses'
+    client = StreamClient([]) if streaming else Client([])
+    baseline = model(protocol, client, streaming=streaming).wire(req)
+    wire = model(protocol, client, streaming=streaming, force_final_delivery=True).wire(req)
+    assert wire['tool_choice'] == expected
+    assert wire == {**baseline, 'tool_choice': expected}
+
+
+@pytest.mark.parametrize('protocol', [
+    'anthropic-messages', 'openai-chat', 'openai-responses', 'openai-codex-responses'])
+@pytest.mark.parametrize('force,remaining,purpose', [
+    (False, 1, 'model'), (True, 2, 'model'), (True, None, 'model'),
+    (True, 1, 'summary'),
+])
+def test_final_delivery_choice_only_applies_to_last_forced_model_call(protocol, force, remaining, purpose):
+    streaming = protocol == 'openai-codex-responses'
+    client = StreamClient([]) if streaming else Client([])
+    params = {'thinking': {'type': 'disabled'}} if protocol == 'anthropic-messages' else {}
+    adapter = model(protocol, client, streaming=streaming, force_final_delivery=force,
+        profile_args={'parameters_json': json.dumps(params)})
+    wire = adapter.wire(replace(request(), remaining_model_calls=remaining, purpose=purpose))
+    if purpose == 'summary':
+        assert 'tool_choice' not in wire and 'tools' not in wire
+    else:
+        assert wire['tool_choice'] == ({'type': 'auto'} if protocol == 'anthropic-messages' else 'auto')
+
+
 @pytest.mark.parametrize('effort', ['low', 'medium', 'high', 'xhigh', 'max'])
 def test_anthropic_effort_reaches_wire_without_changing_cache_history_or_output_limit(effort):
     client = Client([anthropic()])

@@ -916,7 +916,13 @@ class NativeModelAdapter:
                     wire.setdefault('parallel_tool_calls', False)
             if tools and request.purpose != 'summary':
                 choice = "auto"
+                # Anthropic forbids a named tool while thinking may be active,
+                # including the provider default when no thinking object is supplied.
+                can_force_delivery = (self.profile.protocol != 'anthropic-messages'
+                    or (isinstance(params.get('thinking'), dict)
+                        and params['thinking'].get('type') == 'disabled'))
                 if (self.force_final_delivery and request.remaining_model_calls == 1
+                        and can_force_delivery
                         and any(spec["name"] == DELIVERY_TOOL for spec in tools)):
                     choice = {"type": "function", "function": {"name": DELIVERY_TOOL}}
                 wire.update(tools=[{"type": "function", "function": {"name": spec["name"],

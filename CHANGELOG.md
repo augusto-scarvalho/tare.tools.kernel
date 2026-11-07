@@ -4,6 +4,8 @@ Notable changes to `tare.tools.kernel` are recorded here, newest first.
 
 ## Unreleased
 
+- Fix forced final delivery incompatible with Anthropic thinking: the last call keeps automatic tool choice unless the profile explicitly sets `thinking` to an object with `type: disabled`. The budget warning and thinking parameters are preserved; OpenAI protocols still force the delivery tool. Covered by offline payload regressions, not live API validation.
+
 - `restore_bytes` undoes a deletion: with `after=None` it recreates the file's earlier bytes while the file is still absent, and preserves a file created in the meantime. Undoing a turn that deleted a file failed with `invalid_restore_snapshot`.
 - Boolean tool arguments accept the text `"true"`/`"false"` that text-only call formats (Qwen's XML form) send, as `"null"` already was for a missing file's hash, so a local model can delete a file; Codex's strict replies carry `delete: null` for an ordinary edit.
 - The native `edit` tool deletes a file: `delete=true`, `changes=[]` and the file's current SHA-256, within the writable scope and review, rechecking the hash before the unlink and recording the intent so an interrupted deletion is recovered without replay. A native implementer could create and change files but never remove one, so a file it created by mistake stayed in its candidate. It is the only deletion: the standalone `delete` operation of `mediated_tools`, which no host offered and which lacked those guards, is removed.
