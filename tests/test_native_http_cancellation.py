@@ -45,7 +45,8 @@ def endpoint(mode='stall'):
                     # A provider's 400 says what was wrong, sometimes echoing the key it was sent.
                     key = self.headers.get('Authorization', '').split()[-1]
                     body = json.dumps({'error': {'type': 'invalid_request_error', 'message':
-                        f'messages.3.content.0: invalid thinking signature (key {key}, sk-ant-ab***yz)'}}).encode()
+                        f'messages.3.content.0: invalid thinking signature (key {key}, sk-ant-ab***yz, account '
+                        f"{self.headers.get('ChatGPT-Account-Id')})"}}).encode()
                     self.send_response(400)
                     self.send_header('Content-Length', str(len(body)))
                     self.end_headers()
@@ -411,10 +412,11 @@ def test_a_reserved_gpu_is_a_busy_reason_with_its_time_left():
 
 def test_a_refused_request_keeps_the_providers_reason_without_credentials():
     with endpoint('refused') as (url, *_):
-        client = NativeHttpClient(url, credential=lambda: 'real-credential-value-123')
+        client = NativeHttpClient(url, credential=lambda: 'real-credential-value-123',
+                                  request_headers=lambda: {'ChatGPT-Account-Id': 'account-4242'})
         with pytest.raises(ModelFailure) as caught:
             client.post('/test', {}, real_control())
     receipt = caught.value.transport_observation
     assert caught.value.code == 'HTTP_400' and receipt['provider_error']['type'] == 'invalid_request_error'
     assert receipt['provider_error']['message'].startswith('messages.3.content.0: invalid thinking signature')
-    assert 'real-credential' not in json.dumps(receipt) and 'sk-ant' not in json.dumps(receipt)
+    assert not any(text in json.dumps(receipt) for text in ('real-credential', 'sk-ant', 'account-4242'))

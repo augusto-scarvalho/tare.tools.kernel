@@ -40,6 +40,8 @@ STREAM_REASONS = frozenset({
 GPU_BUSY_REASONS = frozenset({'gpu_busy', 'gpu_lease_timeout', 'gpu_lease_cancelled', 'gpu_reserved'})
 MAX_RETRY_AFTER = 24 * 3600  # a 12-hour training run on the node says 12 h
 MAX_PROVIDER_MESSAGE = 300
+# The only request headers whose values a provider's message may keep; account, session and any future header go.
+PLAIN_HEADERS = frozenset({'content-type', 'accept', 'content-length', 'user-agent'})
 # A key, a bearer token or a masked key a provider echoes (e.g. "Incorrect API key provided: sk-ab***yz").
 SECRET_SHAPES = re.compile(r'(?i)bearer\s+\S+|\bsk-[\w.*-]+|[A-Za-z0-9+/_=-]{32,}')
 
@@ -65,8 +67,8 @@ def busy_hints(exc, body=None):
 
 def provider_error(status, body, headers):
     """A refused request's own reason (4xx other than 429): the provider's error type and message, so an HTTP 400
-    can be diagnosed. Every credential header value and anything shaped like a key is removed from the message
-    first; a gateway's 429 or 5xx text may echo anything and stays out."""
+    can be diagnosed. Every request header value (but the plain content ones) and anything shaped like a key is
+    removed from the message first; a gateway's 429 or 5xx text may echo anything and stays out."""
     if not 400 <= status < 500 or status == 429:
         return {}
     try:
@@ -82,7 +84,7 @@ def provider_error(status, body, headers):
     message = error.get('message')
     if isinstance(message, str) and message.strip():
         for name, value in headers.items():
-            if isinstance(value, str) and re.search(r'(?i)auth|key|token', name):
+            if isinstance(value, str) and name.lower() not in PLAIN_HEADERS:
                 for secret in (value, value.split()[-1] if value.split() else value):
                     if len(secret) >= 8:
                         message = message.replace(secret, '[redacted]')
