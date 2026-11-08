@@ -4,6 +4,10 @@ Notable changes to `tare.tools.kernel` are recorded here, newest first.
 
 ## Unreleased
 
+- The provider reason drops every request header value a gateway might echo (account and session ids too), not only those named like credentials; Content-Type, Accept, Content-Length and User-Agent are kept.
+
+- A refused HTTP request (4xx other than 429) keeps the provider's reason in its transport receipt as `provider_error` (error type and at most 300 characters of message), after the worker removes every credential header value and anything shaped like a key. Only the status was kept, so an Anthropic HTTP 400 could not be told apart (thinking signature, parameter or size). 429 and 5xx replies still keep only Retry-After and a known busy reason.
+
 - Fix forced final delivery incompatible with Anthropic thinking: the last call keeps automatic tool choice unless the profile explicitly sets `thinking` to an object with `type: disabled`. The budget warning and thinking parameters are preserved; OpenAI protocols still force the delivery tool. Covered by offline payload regressions, not live API validation.
 
 - `restore_bytes` undoes a deletion: with `after=None` it recreates the file's earlier bytes while the file is still absent, and preserves a file created in the meantime. Undoing a turn that deleted a file failed with `invalid_restore_snapshot`.

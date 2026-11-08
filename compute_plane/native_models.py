@@ -351,6 +351,10 @@ def http_failure(frame, receipt, control):
     if status in RETRY_STATUSES and status != 429 and not busy:
         time.sleep(min(UNAVAILABLE_WAIT, control.remaining_seconds()))
     receipt.update({k: v for k, v in (('busy_reason', busy), ('retry_after', after)) if v is not None})
+    reason = frame.get('provider_error')
+    if (isinstance(reason, dict) and reason and set(reason) <= {'type', 'message'}
+            and all(isinstance(v, str) and len(v) <= 300 for v in reason.values())):
+        receipt['provider_error'] = reason  # the worker already removed credentials
     failure = ModelFailure('HTTP_'+str(status), retryable=status in RETRY_STATUSES)
     failure.transport_observation = receipt
     failure.busy_reason, failure.retry_after = busy, after

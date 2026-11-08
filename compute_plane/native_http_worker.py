@@ -8,6 +8,7 @@ Parent containment owns cancellation, including waits inside DNS/TLS libraries.
 """
 import http.client
 import json
+import re
 import socket
 import ssl
 import sys
@@ -38,18 +39,23 @@ STREAM_REASONS = frozenset({
 # A local GPU's gateway refusing text because the GPU is taken (contract gpu-lease/1, docs/GPU_LEASE_CONTRACT.md).
 GPU_BUSY_REASONS = frozenset({'gpu_busy', 'gpu_lease_timeout', 'gpu_lease_cancelled', 'gpu_reserved'})
 MAX_RETRY_AFTER = 24 * 3600  # a 12-hour training run on the node says 12 h
+MAX_PROVIDER_MESSAGE = 300
+# The only request headers whose values a provider's message may keep; account, session and any future header go.
+PLAIN_HEADERS = frozenset({'content-type', 'accept', 'content-length', 'user-agent'})
+# A key, a bearer token or a masked key a provider echoes (e.g. "Incorrect API key provided: sk-ab***yz").
+SECRET_SHAPES = re.compile(r'(?i)bearer\s+\S+|\bsk-[\w.*-]+|[A-Za-z0-9+/_=-]{32,}')
 
 
-def busy_hints(exc):
+def busy_hints(exc, body=None):
     """What an error reply says about waiting, without its text: Retry-After as whole seconds and, for a 503, the
-    gateway's error type when it is one of GPU_BUSY_REASONS. Nothing else of the reply leaves this process."""
+    gateway's error type when it is one of GPU_BUSY_REASONS. Nothing else of a 429 or 5xx reply leaves this process."""
     hints = {}
     after = (exc.headers.get('Retry-After') or '').strip() if exc.headers else ''
     if after.isdigit():
         hints['retry_after'] = min(int(after), MAX_RETRY_AFTER)
     if exc.code == 503:
         try:
-            error = json.loads(exc.read(4096)).get('error')
+            error = json.loads(exc.read(4096) if body is None else body).get('error')
         except (ValueError, OSError, AttributeError):
             error = None
         if isinstance(error, dict) and error.get('type') in GPU_BUSY_REASONS:
@@ -58,6 +64,33 @@ def busy_hints(exc):
             if 'retry_after' not in hints and type(seconds) is int and seconds >= 0:
                 hints['retry_after'] = min(seconds, MAX_RETRY_AFTER)
     return hints
+
+def provider_error(status, body, headers):
+    """A refused request's own reason (4xx other than 429): the provider's error type and message, so an HTTP 400
+    can be diagnosed. Every request header value (but the plain content ones) and anything shaped like a key is
+    removed from the message first; a gateway's 429 or 5xx text may echo anything and stays out."""
+    if not 400 <= status < 500 or status == 429:
+        return {}
+    try:
+        error = json.loads(body).get('error')
+    except (ValueError, AttributeError):
+        return {}
+    if not isinstance(error, dict):
+        return {}
+    found = {}
+    kind = error.get('type') or error.get('code')
+    if isinstance(kind, str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', kind):
+        found['type'] = kind
+    message = error.get('message')
+    if isinstance(message, str) and message.strip():
+        for name, value in headers.items():
+            if isinstance(value, str) and name.lower() not in PLAIN_HEADERS:
+                for secret in (value, value.split()[-1] if value.split() else value):
+                    if len(secret) >= 8:
+                        message = message.replace(secret, '[redacted]')
+        found['message'] = SECRET_SHAPES.sub('[redacted]', message)[:MAX_PROVIDER_MESSAGE]
+    return {'provider_error': found} if found else {}
+
 
 CONNECT_REASONS = frozenset({'DNS_FAILED', 'CONNECTION_REFUSED', 'CONNECT_TIMEOUT',
                              'TLS_CERTIFICATE_FAILED', 'TLS_FAILED', 'CONNECTION_FAILED'})
@@ -191,8 +224,13 @@ def main():
             if len(body) > MAX_BODY:
                 raise ValueError('response_limit')
         except urllib.error.HTTPError as exc:
-            # Status and busy_hints only: errors may echo credentials or private request text.
-            frame = {'kind': 'http_error', 'status': exc.code, **busy_hints(exc)}
+            # Status, busy_hints and a refused request's redacted reason only: errors may echo credentials.
+            try:
+                body = exc.read(8192)
+            except (OSError, AttributeError, ValueError):
+                body = b''
+            frame = {'kind': 'http_error', 'status': exc.code, **busy_hints(exc, body),
+                     **provider_error(exc.code, body, request['headers'])}
             exc.close()
             sys.stdout.buffer.write(json.dumps(frame).encode() + b'\n')
             return
