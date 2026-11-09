@@ -4,8 +4,25 @@ import io
 import os
 from pathlib import Path
 import tarfile
+import time
+import urllib.error
 import urllib.request
 import zipfile
+
+
+def fetch(url, attempts=8, sleep=time.sleep):
+    """GitHub's release download answers 5xx or times out now and then (504s failed every shard on 2026-11-09 for
+    some minutes); a shard waits that out. A 4xx other than 429 is not transient and fails at once, like a digest
+    mismatch."""
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(url, timeout=60) as response:
+                return response.read(8*1024*1024+1)
+        except OSError as error:  # URLError, HTTPError, a reset connection or a timeout
+            code = getattr(error, 'code', None)
+            if (code is not None and code != 429 and code < 500) or attempt == attempts-1:
+                raise
+            sleep(min(2**(attempt+1), 60))  # some 3 minutes in all: the 504s of 2026-11-09 outlasted 30 s
 
 
 def main():
@@ -16,8 +33,7 @@ def main():
          '4cf9f2741e6c465ffdb7c26f38056a59e2a2544b51f7cc128ef28337eeae4d8e', 'rg'))
     # Hashes published alongside the upstream 14.1.1 release assets.
     url = 'https://github.com/BurntSushi/ripgrep/releases/download/14.1.1/'+asset
-    with urllib.request.urlopen(url, timeout=60) as response:
-        raw = response.read(8*1024*1024+1)
+    raw = fetch(url)
     if hashlib.sha256(raw).hexdigest() != digest:
         raise ValueError('ripgrep_archive_digest_mismatch')
     folder = asset.removesuffix('.zip').removesuffix('.tar.gz')
