@@ -894,6 +894,19 @@ OpenCode marks `estimated: true` (the customer's own provider key) estimates tha
 as a charge. See
 [OpenCode inference](https://opencode.ai/docs/console/api/inference) and [OpenCode Go](https://opencode.ai/docs/go).
 
+## Billing guard and quota refusals
+
+A profile may declare `billing_sources`, the provider-reported billing sources it may be charged to (lowercase names,
+HTTP API protocols only). OpenCode reports one per reply in `usage.opencode.billing_source`. A reply billed to any
+other source, such as `balance` for a subscription profile whose allowance ran out with Extra Usage on, keeps its
+usage on record, marks the observation `billing_refused` with that source, and ends the session with
+`BILLING_SOURCE_REFUSED` before another call is billed the same way. A reply without a reported source passes, and so
+does a profile without the field, whose digest stays unchanged.
+
+A refused HTTP 429 keeps its error type in the transport receipt's `provider_error`, a single word such as OpenCode's
+`GoUsageLimitError`, so the host can tell a spent plan from a passing rate limit; with `retry_after` (from
+Retry-After, up to 24 hours) it knows when the plan's window resets. The 429's message stays out, as before.
+
 ## Streaming reasoning custody (0.9.73)
 
 Chat streaming consolidates consecutive indexed `reasoning.text` and

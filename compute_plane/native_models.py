@@ -244,6 +244,9 @@ class ModelProfile:
     count_model_source: str | None = None
     # The gateway's per-conversation header (OpenCode: x-opencode-session); the value is the session's opaque key.
     session_header: str | None = None
+    # The provider-reported billing sources this profile may be charged to (OpenCode: usage.opencode.billing_source);
+    # a reply billed to any other source ends the session after that one call.
+    billing_sources: tuple[str, ...] | None = None
 
     def __post_init__(self):
         if self.protocol not in CHAT_PROTOCOLS | {"bedrock-converse"}:
@@ -319,6 +322,13 @@ class ModelProfile:
                 self.protocol not in {'openai-chat', 'openai-responses', 'anthropic-messages'}
                 or self.session_header not in SESSION_HEADERS):
             raise ValueError('session header must be a known provider session header on an HTTP API profile')
+        if self.billing_sources is not None:
+            sources = self.billing_sources
+            if (self.protocol not in {'openai-chat', 'openai-responses', 'anthropic-messages'}
+                    or not isinstance(sources, (list, tuple)) or not sources
+                    or any(not isinstance(s, str) or not re.fullmatch(r'[a-z][a-z-]{0,31}', s) for s in sources)):
+                raise ValueError('billing sources must be lowercase names on an HTTP API profile')
+            object.__setattr__(self, 'billing_sources', tuple(sources))
         object.__setattr__(self, "parameters_json", encode(params))
 
 
@@ -365,7 +375,9 @@ def http_failure(frame, receipt, control):
     if (isinstance(reason, dict) and reason and set(reason) <= {'type', 'message'}
             and all(isinstance(v, str) and len(v) <= 300 for v in reason.values())):
         receipt['provider_error'] = reason  # the worker already removed credentials
-    failure = ModelFailure('HTTP_'+str(status), retryable=status in RETRY_STATUSES)
+    # A 429 that resets after this call's time is up (a spent plan: OpenCode says hours) is not retried now.
+    spent = status == 429 and after is not None and after > control.remaining_seconds()
+    failure = ModelFailure('HTTP_'+str(status), retryable=status in RETRY_STATUSES and not spent)
     failure.transport_observation = receipt
     failure.busy_reason, failure.retry_after = busy, after
     return failure
@@ -672,8 +684,9 @@ class NativeModelAdapter:
                 raise ValueError("explicit named tool schema required")
         self._specs_json = encode(specs)
         identity = {"profile": asdict(profile), "system": system, "tools": specs}
-        if profile.session_header is None:
-            del identity['profile']['session_header']  # existing profile digests stay unchanged
+        for field_name in ('session_header', 'billing_sources'):
+            if getattr(profile, field_name) is None:
+                del identity['profile'][field_name]  # existing profile digests stay unchanged
         if image_media_types:
             identity['image_media_types'] = sorted(image_media_types)
         if streaming: identity['streaming'] = True
@@ -992,6 +1005,14 @@ class NativeModelAdapter:
             wire["additionalModelRequestFields"] = params["additionalModelRequestFields"]
         return wire
 
+    def _refused_billing(self, usage):
+        """The billing source a reply reports when the profile does not allow it, else None (also when unreported)."""
+        if self.profile.billing_sources is None or not isinstance(usage, dict):
+            return None
+        gateway = usage.get('opencode')
+        source = gateway.get('billing_source') if isinstance(gateway, dict) else None
+        return source if isinstance(source, str) and source not in self.profile.billing_sources else None
+
     @staticmethod
     def _session_key(request):
         # Opaque and stable across turns, compaction and resume, so a provider can route and cache by it.
@@ -1066,6 +1087,11 @@ class NativeModelAdapter:
                 response = self._post(self.client, self._generation_path(streaming=False), transmitted, control, row,
                                       headers)
             row["usage"] = response.get("usage")  # Raw provider counters, never missing -> zero.
+            refused = self._refused_billing(row["usage"])
+            if refused:
+                # Charged already: keep the usage, stop before another call is billed the same way.
+                row.update(status='billing_refused', billing_source=refused)
+                raise ModelFailure('BILLING_SOURCE_REFUSED')
             timing_key = 'timings' if self.profile.protocol in CHAT_PROTOCOLS else 'metrics'
             if isinstance(response.get(timing_key), dict):
                 row['provider_timing'] = {'source': self.profile.protocol + '.' + timing_key,

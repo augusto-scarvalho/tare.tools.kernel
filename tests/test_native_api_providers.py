@@ -394,3 +394,49 @@ def test_loopback_session_header_on_every_opencode_family(protocol):
         assert all(received['authorization'] == 'Bearer fixture-key' for _, received in seen)
     finally:
         server.shutdown(); server.server_close(); thread.join(2)
+
+
+def test_a_429_keeps_only_its_error_type():
+    from compute_plane.native_http_worker import provider_error
+    spent = (b'{"type":"error","error":{"type":"GoUsageLimitError","message":"Go usage limit exceeded"},'
+             b'"metadata":{"workspace":"org_secret","limitName":"5 hour"}}')
+    assert provider_error(429, spent, {}) == {'provider_error': {'type': 'GoUsageLimitError'}}
+    assert provider_error(429, b'{"error":{"type":"not one word","message":"x"}}', {}) == {}
+    assert provider_error(429, b'rate limited', {}) == {}
+    assert provider_error(503, spent, {}) == {}
+
+
+@pytest.mark.parametrize('sources', [[], ['Go'], ['go', 'x' * 40], 'go'])
+def test_billing_sources_must_be_lowercase_names(sources):
+    with pytest.raises(ValueError):
+        ModelProfile('openai-chat', 'fixture', 32768, 1024, 'fixture', 'http://fixture', billing_sources=sources)
+
+
+@pytest.mark.parametrize('source,refused', [('go', False), ('go-plus', False), ('balance', True), (None, False)])
+def test_a_reply_billed_outside_the_profile_stops_the_session(source, refused):
+    usage = {'prompt_tokens': 10, 'completion_tokens': 2, 'cost': 0.01 if source == 'balance' else 0,
+             'opencode': {'tokens': {}, **({'billing_source': source} if source else {})}}
+    reply = {**chat_reply(), 'usage': usage}
+    rows = []
+    adapter = model('openai-chat', Client([reply]), observe=rows.append,
+                    profile_args={'billing_sources': ['go', 'go-plus']})
+    if refused:
+        with pytest.raises(ModelFailure, match='BILLING_SOURCE_REFUSED'):
+            adapter.generate(request(), execution())
+        assert rows[-1]['status'] == 'billing_refused' and rows[-1]['usage'] == usage  # the charge stays on record
+        assert rows[-1]['billing_source'] == 'balance'
+    else:
+        assert adapter.generate(request(), execution()).proposes_delivery
+
+
+def test_a_429_type_shaped_like_a_key_is_dropped():
+    from compute_plane.native_http_worker import provider_error
+    key = 'sk-' + 'a' * 48
+    assert provider_error(429, ('{"error":{"code":"' + key + '"}}').encode(), {}) == {}
+
+
+def test_a_429_resetting_after_the_call_is_not_retried_now():
+    from compute_plane.native_models import http_failure
+    long = http_failure({'status': 429, 'retry_after': 14921}, {}, execution())
+    short = http_failure({'status': 429, 'retry_after': 5}, {}, execution())
+    assert not long.retryable and short.retryable and long.code == short.code == 'HTTP_429'

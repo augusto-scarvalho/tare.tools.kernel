@@ -67,7 +67,7 @@ def test_generation_requires_count_and_confirmation():
 def test_legacy_digest_and_request_are_byte_compatible():
     client=Fleet();model=adapter(client)
     from tests.test_native_models import SPECS
-    legacy={k:v for k,v in asdict(model.profile).items() if k!='session_header'}  # fields before session headers
+    legacy={k:v for k,v in asdict(model.profile).items() if k not in ('session_header','billing_sources')}  # earlier fields
     assert model.profile_digest==sha({'profile':legacy,'system':'stable','tools':json.loads(SPECS)})
     assert 'tare_fleet_binding' not in model.wire(request())
     with pytest.raises(ValueError,match='generation gateway'):
