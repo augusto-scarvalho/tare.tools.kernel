@@ -405,3 +405,42 @@ def test_not_dispatched_intent_does_not_invent_usage_or_unknown_remote_charge():
     assert result["calls"][0]["raw_usage"] is None
     with pytest.raises(ValueError, match="not-started intent"):
         report(adapter, stopped, rows)
+
+
+OPENCODE = UsageContract('opencode-exclusive', 'https://opencode.ai/docs/console/api/inference')
+# The documented usage example, billed to the Go plan within its limits.
+OPENCODE_USAGE = {'prompt_tokens': 1200, 'completion_tokens': 300, 'cost': 0,
+                  'opencode': {'billing_source': 'go', 'list_cost': 0.00412, 'allowance': 0.00412,
+                               'tokens': {'input': 1200, 'output': 300, 'reasoning': 120, 'cache_read': 8000,
+                                          'cache_write_5m': 0, 'cache_write_1h': 0}}}
+
+
+def test_opencode_reads_its_disjoint_counters_not_the_family_counters():
+    value = normalize_usage(OPENCODE_USAGE, OPENCODE)
+    assert value['issues'] == []
+    assert value['tokens'] == dict(input_tokens=9200, uncached_input_tokens=1200, cache_read_tokens=8000,
+                                   cache_write_tokens=0, output_tokens=300, reasoning_tokens=120, total_tokens=9500)
+    family_only = {'prompt_tokens': 1200, 'completion_tokens': 300}
+    assert normalize_usage(family_only, OPENCODE)['tokens'] == dict.fromkeys(value['tokens'])  # unknown, never zero
+
+
+def test_opencode_charge_keeps_billing_source_list_cost_and_allowance():
+    from compute_plane.native_usage import reported_cost
+    cost = reported_cost(OPENCODE_USAGE, OPENCODE)
+    assert cost['known_amount'] == '0' and cost['basis'] == 'provider_reported' and cost['source'] == 'opencode.usage.cost'
+    assert cost['opencode'] == {'billing_source': 'go', 'list_cost': '0.00412', 'allowance': '0.00412'}
+    odd = {**OPENCODE_USAGE, 'opencode': {**OPENCODE_USAGE['opencode'], 'billing_source': 'gift', 'allowance': -1}}
+    assert reported_cost(odd, OPENCODE)['opencode'] == {'billing_source': None, 'list_cost': '0.00412', 'allowance': None}
+    assert reported_cost({**OPENCODE_USAGE, 'cost': 'NaN'}, OPENCODE) is None
+    byok = {**OPENCODE_USAGE, 'cost': 0.0041, 'opencode': {**OPENCODE_USAGE['opencode'], 'billing_source': 'byok', 'estimated': True}}
+    assert reported_cost(byok, OPENCODE) is None
+
+
+def test_opencode_report_accepts_its_families_and_rejects_others():
+    adapter, log, rows, _ = run_session([response('openai-chat', DELIVERY_TOOL, usage=OPENCODE_USAGE)])
+    result = native_usage_report(log, rows, contracts={adapter.profile_digest: OPENCODE})
+    assert result['known_cost_by_currency'] == {'USD': '0'}
+    assert result['calls'][0]['cost']['opencode']['billing_source'] == 'go'
+    rows[0]['protocol'] = 'bedrock-converse'
+    with pytest.raises(ValueError, match='protocol mismatch'):
+        native_usage_report(log, rows, contracts={adapter.profile_digest: OPENCODE})

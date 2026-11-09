@@ -300,3 +300,97 @@ def test_anthropic_inline_images_and_explicit_cache_preserved():
     assert result['messages'][0]['content'][0] == {'type': 'image', 'source': {
         'type': 'base64', 'media_type': 'image/png', 'data': 'YWJj'}}
     assert result['cache_control'] == {'type': 'ephemeral'} and 'cache_control' not in result['system'][0]
+
+
+def test_profile_without_session_header_keeps_its_digest():
+    # The digest main produced for this profile before session headers existed.
+    assert model('openai-chat', Client([])).profile_digest == (
+        'd7f65762172c3b2772a60e9160790b7236594ee7bb575088a7d2a120b05768bc')
+    declared = model('openai-chat', Client([]), profile_args={'session_header': 'x-opencode-session'})
+    assert declared.profile_digest != model('openai-chat', Client([])).profile_digest
+
+
+@pytest.mark.parametrize('protocol,header', [
+    ('openai-chat', 'authorization'), ('openai-chat', 'x-api-key'), ('openai-chat', 'X-Opencode-Session'),
+    ('bedrock-converse', 'x-opencode-session'), ('openai-chat', '')])
+def test_session_header_must_be_known_on_an_http_api_profile(protocol, header):
+    with pytest.raises(ValueError):
+        ModelProfile(protocol, 'fixture', 32768, 1024, 'fixture', 'http://fixture', session_header=header)
+
+
+@pytest.mark.parametrize('headers', [{'x-api-key': 'value'}, {'Authorization': 'Bearer other'},
+                                     {'x-opencode-session': 'a\r\nx-secret: b'}, {'x-opencode-session': ''}])
+def test_invalid_exchange_headers_refused_before_http(headers):
+    client = NativeHttpClient('http://127.0.0.1:1', credential=lambda: pytest.fail('credential read'),
+                              request_headers=lambda: pytest.fail('request headers read'))
+    with pytest.raises(ValueError):
+        client.post_observed('/chat/completions', {}, execution(), headers=headers)
+
+
+def chat_reply():
+    return {**chat_response('openai-chat', 'tare_deliver'), 'model': 'fixture'}
+
+
+class HeaderClient:
+    endpoint = 'http://fixture'
+
+    def __init__(self, reply):
+        self.reply, self.headers = reply, []
+
+    def post_observed(self, path, body, control, **kwargs):
+        self.headers.append(kwargs.get('headers'))
+        return self.reply, {'transport': 'fixture'}
+
+    def post_stream_observed(self, path, body, control, *, protocol, on_event=None, **kwargs):
+        self.headers.append(kwargs.get('headers'))
+        return self.reply, {'transport': 'fixture'}
+
+
+@pytest.mark.parametrize('streaming', [False, True])
+def test_declared_session_header_is_stable_per_session_and_absent_otherwise(streaming):
+    from compute_plane.native_models import sha
+    reply = chat_reply()
+    declared = HeaderClient(reply)
+    adapter = model('openai-chat', declared, streaming=streaming, profile_args={'session_header': 'x-opencode-session'})
+    adapter.generate(request(), execution()); adapter.generate(request(), execution())
+    assert declared.headers == [{'x-opencode-session': 'tare-' + sha({'session': 's'})}] * 2
+    plain = HeaderClient(reply)
+    model('openai-chat', plain, streaming=streaming).generate(request(), execution())
+    assert plain.headers == [None]
+
+
+def test_session_header_reaches_a_plain_port_without_breaking_it():
+    client = Client([chat_reply()])
+    adapter = model('openai-chat', client, profile_args={'session_header': 'x-opencode-session'})
+    assert adapter.generate(request(), execution()).proposes_delivery
+
+
+@pytest.mark.parametrize('protocol', ['openai-chat', 'openai-responses', 'anthropic-messages'])
+def test_loopback_session_header_on_every_opencode_family(protocol):
+    seen = []
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers['Content-Length']))
+            seen.append((self.path, {k.lower(): v for k, v in self.headers.items()}))
+            data = json.dumps(anthropic('tare_deliver') if protocol == 'anthropic-messages'
+                              else responses_response('tare_deliver') if protocol == 'openai-responses'
+                              else chat_reply()).encode()
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        def log_message(self, *args): pass
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = NativeHttpClient(f'http://127.0.0.1:{server.server_port}/v1', credential=lambda: 'fixture-key')
+        adapter = model(protocol, client, profile_args={'session_header': 'x-opencode-session'})
+        adapter.generate(request(), execution()); adapter.generate(request(), execution())
+        assert [path for path, _ in seen] == ['/v1/' + {'openai-chat': 'chat/completions', 'openai-responses': 'responses',
+                                                         'anthropic-messages': 'messages'}[protocol]] * 2
+        keys = {received['x-opencode-session'] for _, received in seen}
+        assert len(keys) == 1 and keys.pop().startswith('tare-')
+        assert all(received['authorization'] == 'Bearer fixture-key' for _, received in seen)
+    finally:
+        server.shutdown(); server.server_close(); thread.join(2)

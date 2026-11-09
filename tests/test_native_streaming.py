@@ -248,3 +248,11 @@ def test_streaming_changes_counted_wire_and_profile_identity_only_when_selected(
     stream=NativeModelAdapter(p,client,system='system',tool_specs_json=SPECS,streaming=True)
     assert stream.profile_digest!=normal.profile_digest and stream.wire(request())['stream'] is True
     assert normal.wire(request())['stream'] is False
+
+
+def test_opencode_usage_frame_is_kept_whole():
+    usage = {'prompt_tokens': 20, 'completion_tokens': 5, 'cost': 0,
+             'opencode': {'billing_source': 'go', 'allowance': 0.0001, 'tokens': {'input': 20, 'output': 5}}}
+    parts = chat_parts()
+    parts[-2] = sse({'model': 'fixture', 'choices': [], 'usage': usage})
+    assert chat(io.BytesIO(b''.join(parts)), lambda e: None)['usage'] == usage

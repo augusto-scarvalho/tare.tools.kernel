@@ -223,6 +223,10 @@ def sha(value: dict) -> str:
     return hashlib.sha256(encode(value).encode()).hexdigest()
 
 
+# Provider headers that belong to one exchange (a profile's declared session header), never a credential.
+SESSION_HEADERS = frozenset({'x-opencode-session'})
+
+
 @dataclass(frozen=True)
 class ModelProfile:
     protocol: str
@@ -238,6 +242,8 @@ class ModelProfile:
     cache_support_source: str | None = None
     count_model: str | None = None
     count_model_source: str | None = None
+    # The gateway's per-conversation header (OpenCode: x-opencode-session); the value is the session's opaque key.
+    session_header: str | None = None
 
     def __post_init__(self):
         if self.protocol not in CHAT_PROTOCOLS | {"bedrock-converse"}:
@@ -309,6 +315,10 @@ class ModelProfile:
             raise ValueError('distinct count model requires explicit Bedrock route evidence')
         if self.count_model is None and self.count_model_source is not None:
             raise ValueError('count model source requires count model')
+        if self.session_header is not None and (
+                self.protocol not in {'openai-chat', 'openai-responses', 'anthropic-messages'}
+                or self.session_header not in SESSION_HEADERS):
+            raise ValueError('session header must be a known provider session header on an HTTP API profile')
         object.__setattr__(self, "parameters_json", encode(params))
 
 
@@ -391,19 +401,21 @@ class NativeHttpClient:
     def post(self, path, body, control):
         return self.post_observed(path, body, control)[0]
 
-    def post_stream_observed(self, path, body, control, *, protocol, on_event=None):
+    def post_stream_observed(self, path, body, control, *, protocol, on_event=None, headers=None):
         if protocol not in CHAT_PROTOCOLS | {'bedrock-converse'}:
             raise ValueError('unsupported stream protocol')
-        return self.post_observed(path, body, control, stream_protocol=protocol, on_event=on_event)
+        return self.post_observed(path, body, control, stream_protocol=protocol, on_event=on_event, headers=headers)
 
-    def post_observed(self, path, body, control, *, stream_protocol=None, on_event=None):
-        return self._exchange(path, body, control, stream_protocol=stream_protocol, on_event=on_event)
+    def post_observed(self, path, body, control, *, stream_protocol=None, on_event=None, headers=None):
+        return self._exchange(path, body, control, stream_protocol=stream_protocol, on_event=on_event,
+                              exchange_headers=headers)
 
     def get_observed(self, path, control):
         """One bounded read-only JSON request; same containment and no redirects/retries."""
         return self._exchange(path, None, control, method='GET')
 
-    def _exchange(self, path, body, control, *, method='POST', stream_protocol=None, on_event=None):
+    def _exchange(self, path, body, control, *, method='POST', stream_protocol=None, on_event=None,
+                  exchange_headers=None):
         from .managed_process import run_pipe_process
 
         if not path.startswith("/") or path.startswith("//") or "?" in path or "#" in path:
@@ -418,6 +430,11 @@ class NativeHttpClient:
         if control.should_stop():
             raise NativeTransportInterrupted("control stopped before dispatch", receipt)
         headers = {"Content-Type": "application/json"}
+        for name, value in (exchange_headers or {}).items():
+            if (name not in SESSION_HEADERS or not isinstance(value, str) or not value or len(value) > 8192
+                    or any(ord(character) < 32 or ord(character) > 126 for character in value)):
+                raise ValueError('invalid exchange header')
+            headers[name] = value
         if self.request_headers is not None:
             try:
                 extra = self.request_headers()
@@ -655,6 +672,8 @@ class NativeModelAdapter:
                 raise ValueError("explicit named tool schema required")
         self._specs_json = encode(specs)
         identity = {"profile": asdict(profile), "system": system, "tools": specs}
+        if profile.session_header is None:
+            del identity['profile']['session_header']  # existing profile digests stay unchanged
         if image_media_types:
             identity['image_media_types'] = sorted(image_media_types)
         if streaming: identity['streaming'] = True
@@ -915,7 +934,7 @@ class NativeModelAdapter:
                     and self.profile.endpoint.rstrip('/') == 'https://openrouter.ai/api/v1'):
                 # Sticky routing starts before the first cache hit. Keep this
                 # opaque key stable across turns, compaction and session resume.
-                wire.setdefault('session_id', 'tare-' + sha({'session': request.session_id}))
+                wire.setdefault('session_id', self._session_key(request))
                 if tools and self._argument_repair(request):
                     wire.setdefault('parallel_tool_calls', False)
             if tools and request.purpose != 'summary':
@@ -934,7 +953,7 @@ class NativeModelAdapter:
                         for spec in tools], tool_choice=choice)
             if self.profile.protocol in {'openai-codex-responses', 'openai-responses'}:
                 from .native_responses import to_responses
-                cache_key = 'tare-' + sha({'session': request.session_id})
+                cache_key = self._session_key(request)
                 if self.profile.protocol == 'openai-responses':
                     # The API rejects values over 64 characters before inference.
                     cache_key = cache_key[:64]
@@ -973,6 +992,11 @@ class NativeModelAdapter:
             wire["additionalModelRequestFields"] = params["additionalModelRequestFields"]
         return wire
 
+    @staticmethod
+    def _session_key(request):
+        # Opaque and stable across turns, compaction and resume, so a provider can route and cache by it.
+        return 'tare-' + sha({'session': request.session_id})
+
     def _generation_path(self, *, streaming):
         if self.profile.protocol == 'anthropic-messages':
             return '/messages'
@@ -987,11 +1011,11 @@ class NativeModelAdapter:
         return "/model/" + urllib.parse.quote(model, safe="") + "/" + operation
 
     @staticmethod
-    def _post(client, path, wire, control, row):
+    def _post(client, path, wire, control, row, headers=None):
         if not callable(getattr(client, 'post_observed', None)):
-            return client.post(path, wire, control)
+            return client.post(path, wire, control)  # a plain port carries no transport headers
         try:
-            response, physical = client.post_observed(path, wire, control)
+            response, physical = client.post_observed(path, wire, control, **({'headers': headers} if headers else {}))
         except Exception as exc:
             physical = getattr(exc, 'transport_observation', None)
             if physical is not None:
@@ -1012,6 +1036,7 @@ class NativeModelAdapter:
         if request.remaining_model_calls is not None:
             row['remaining_model_calls'] = request.remaining_model_calls
         started = time.monotonic()
+        headers = {self.profile.session_header: self._session_key(request)} if self.profile.session_header else None
         try:
             transmitted = wire
             if self.counter_protocol == 'slop-fleet-v1':
@@ -1028,7 +1053,8 @@ class NativeModelAdapter:
                 try:
                     response, physical = self.client.post_stream_observed(
                         self._generation_path(streaming=True),
-                        transmitted,control,protocol=self.profile.protocol,on_event=progress)
+                        transmitted,control,protocol=self.profile.protocol,on_event=progress,
+                        **({'headers': headers} if headers else {}))
                     row.setdefault('transport_calls',[]).append(physical)
                 except Exception as exc:
                     physical = getattr(exc,'transport_observation',None)
@@ -1037,7 +1063,8 @@ class NativeModelAdapter:
                         row['usage'] = physical.get('stream_usage')
                     raise
             else:
-                response = self._post(self.client, self._generation_path(streaming=False), transmitted, control, row)
+                response = self._post(self.client, self._generation_path(streaming=False), transmitted, control, row,
+                                      headers)
             row["usage"] = response.get("usage")  # Raw provider counters, never missing -> zero.
             timing_key = 'timings' if self.profile.protocol in CHAT_PROTOCOLS else 'metrics'
             if isinstance(response.get(timing_key), dict):
