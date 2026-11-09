@@ -427,3 +427,16 @@ def test_a_reply_billed_outside_the_profile_stops_the_session(source, refused):
         assert rows[-1]['billing_source'] == 'balance'
     else:
         assert adapter.generate(request(), execution()).proposes_delivery
+
+
+def test_a_429_type_shaped_like_a_key_is_dropped():
+    from compute_plane.native_http_worker import provider_error
+    key = 'sk-' + 'a' * 48
+    assert provider_error(429, ('{"error":{"code":"' + key + '"}}').encode(), {}) == {}
+
+
+def test_a_429_resetting_after_the_call_is_not_retried_now():
+    from compute_plane.native_models import http_failure
+    long = http_failure({'status': 429, 'retry_after': 14921}, {}, execution())
+    short = http_failure({'status': 429, 'retry_after': 5}, {}, execution())
+    assert not long.retryable and short.retryable and long.code == short.code == 'HTTP_429'

@@ -80,7 +80,7 @@ def provider_error(status, body, headers):
         return {}
     found = {}
     kind = error.get('type') or error.get('code')
-    if isinstance(kind, str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', kind):
+    if isinstance(kind, str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', kind) and not SECRET_SHAPES.search(kind):
         found['type'] = kind
     if status == 429:
         return {'provider_error': found} if found else {}

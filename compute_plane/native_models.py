@@ -375,7 +375,9 @@ def http_failure(frame, receipt, control):
     if (isinstance(reason, dict) and reason and set(reason) <= {'type', 'message'}
             and all(isinstance(v, str) and len(v) <= 300 for v in reason.values())):
         receipt['provider_error'] = reason  # the worker already removed credentials
-    failure = ModelFailure('HTTP_'+str(status), retryable=status in RETRY_STATUSES)
+    # A 429 that resets after this call's time is up (a spent plan: OpenCode says hours) is not retried now.
+    spent = status == 429 and after is not None and after > control.remaining_seconds()
+    failure = ModelFailure('HTTP_'+str(status), retryable=status in RETRY_STATUSES and not spent)
     failure.transport_observation = receipt
     failure.busy_reason, failure.retry_after = busy, after
     return failure
