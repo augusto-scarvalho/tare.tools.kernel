@@ -214,6 +214,8 @@ def reported_cost(raw, contract: UsageContract | None):
         return None
     if contract.layout == 'opencode-exclusive':
         gateway = raw.get('opencode') if isinstance(raw.get('opencode'), dict) else {}
+        if gateway.get('estimated') is True:
+            return None  # with the customer's own provider key, cost estimates that provider's bill: not a charge
         source = gateway.get('billing_source')
         known = {'list_cost': _amount(gateway.get('list_cost')), 'allowance': _amount(gateway.get('allowance'))}
         return {'currency': 'USD', 'known_amount': str(amount), 'complete': True,

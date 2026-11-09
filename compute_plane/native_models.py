@@ -430,6 +430,11 @@ class NativeHttpClient:
         if control.should_stop():
             raise NativeTransportInterrupted("control stopped before dispatch", receipt)
         headers = {"Content-Type": "application/json"}
+        for name, value in (exchange_headers or {}).items():
+            if (name not in SESSION_HEADERS or not isinstance(value, str) or not value or len(value) > 8192
+                    or any(ord(character) < 32 or ord(character) > 126 for character in value)):
+                raise ValueError('invalid exchange header')
+            headers[name] = value
         if self.request_headers is not None:
             try:
                 extra = self.request_headers()
@@ -451,11 +456,6 @@ class NativeHttpClient:
             if 'anthropic-workspace-id' in extra and not re.fullmatch(r'[A-Za-z0-9_-]{1,256}', extra['anthropic-workspace-id']):
                 raise ValueError('invalid anthropic-workspace-id')
             headers.update(extra)
-        for name, value in (exchange_headers or {}).items():
-            if (name not in SESSION_HEADERS or name in headers or not isinstance(value, str) or not value or len(value) > 8192
-                    or any(ord(character) < 32 or ord(character) > 126 for character in value)):
-                raise ValueError('invalid exchange header')
-            headers[name] = value
         key = self.credential()
         if key:
             if 'Authorization' in headers:

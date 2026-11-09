@@ -321,7 +321,8 @@ def test_session_header_must_be_known_on_an_http_api_profile(protocol, header):
 @pytest.mark.parametrize('headers', [{'x-api-key': 'value'}, {'Authorization': 'Bearer other'},
                                      {'x-opencode-session': 'a\r\nx-secret: b'}, {'x-opencode-session': ''}])
 def test_invalid_exchange_headers_refused_before_http(headers):
-    client = NativeHttpClient('http://127.0.0.1:1', credential=lambda: pytest.fail('credential read'))
+    client = NativeHttpClient('http://127.0.0.1:1', credential=lambda: pytest.fail('credential read'),
+                              request_headers=lambda: pytest.fail('request headers read'))
     with pytest.raises(ValueError):
         client.post_observed('/chat/completions', {}, execution(), headers=headers)
 

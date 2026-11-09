@@ -432,6 +432,8 @@ def test_opencode_charge_keeps_billing_source_list_cost_and_allowance():
     odd = {**OPENCODE_USAGE, 'opencode': {**OPENCODE_USAGE['opencode'], 'billing_source': 'gift', 'allowance': -1}}
     assert reported_cost(odd, OPENCODE)['opencode'] == {'billing_source': None, 'list_cost': '0.00412', 'allowance': None}
     assert reported_cost({**OPENCODE_USAGE, 'cost': 'NaN'}, OPENCODE) is None
+    byok = {**OPENCODE_USAGE, 'cost': 0.0041, 'opencode': {**OPENCODE_USAGE['opencode'], 'billing_source': 'byok', 'estimated': True}}
+    assert reported_cost(byok, OPENCODE) is None
 
 
 def test_opencode_report_accepts_its_families_and_rejects_others():
