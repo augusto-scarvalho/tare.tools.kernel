@@ -452,13 +452,15 @@ def decode_agy(rows, hooks, model, *, structured=False):
     # AGY 1.5.3 validates the final action itself and marks finish ERROR when the model broke the schema, yet still
     # reports SUCCESS with the invalid reply: a reply without its required 'text' blocked a TUI session on
     # 2026-11-09. Earlier versions let the model correct it in the same run. Nothing ran, so the call is retried.
-    rejected = [r['step_update']['tool_info'].get('error') for r in rows if r.get('event') == 'step_update'
-                and isinstance(r.get('step_update'), dict) and r['step_update'].get('state') == 'ERROR'
-                and isinstance(r['step_update'].get('tool_info'), dict)
+    finishes = [r['step_update'] for r in rows if r.get('event') == 'step_update'
+                and isinstance(r.get('step_update'), dict) and isinstance(r['step_update'].get('tool_info'), dict)
                 and r['step_update']['tool_info'].get('name') == 'finish']
-    if schema_finish and rejected:  # with a tool hook, finish shows ERROR because Tare's own hook denied it
+    # Only the last finish decides: a version that lets the model correct itself in the run ends with a good one.
+    # With a tool hook, finish shows ERROR because Tare's own hook denied it, so only schema_finish counts.
+    if schema_finish and finishes and finishes[-1].get('state') == 'ERROR':
         failure = ModelFailure('CLI_INVALID_RESPONSE', retryable=True)
-        failure.final_action_error = str((rejected[-1] if isinstance(rejected[-1], dict) else {}).get('message', ''))[:300]
+        error = finishes[-1]['tool_info'].get('error')
+        failure.final_action_error = str((error if isinstance(error, dict) else {}).get('message', ''))[:300]
         finished = [r['result'] for r in rows if r.get('event') == 'result' and isinstance(r.get('result'), dict)]
         failure.usage = finished[0].get('usage') if len(finished) == 1 else None  # the rejected attempt was paid
         raise failure
@@ -649,27 +651,26 @@ class VendorCliClient:
     def post_observed(self, path, body, control):
         """One exchange, repaired once when the CLI itself rejected the final action (AGY 1.5.3 no longer lets the
         model correct it in the same run). The repair names the rejection to the model, which a plain retry of the
-        same request could not; both attempts' tokens are counted and the first stays in the receipt."""
+        same request could not. The response keeps the repair's own usage: for vendor CLIs it is the measured size
+        of one request (the count anchor), so the first attempt's usage stays in the receipt's `repair_of`."""
         try:
             return self._exchange(path, body, control)
         except ModelFailure as exc:
             rejected = getattr(exc, 'final_action_error', None)
             if not isinstance(rejected, str) or control.should_stop():
                 raise
-            first = getattr(exc, 'transport_observation', None)
+            first = {**(getattr(exc, 'transport_observation', None) or {}), 'usage': getattr(exc, 'usage', None)}
             note = ('\n\nYour previous reply was rejected before any action ran: ' + (rejected or 'invalid final action')
                     + '\nSend that decision again as one JSON object with exactly the properties the schema requires.')
             try:
                 response, receipt = self._exchange(path, {**body, 'reminder': body.get('reminder', '') + note}, control)
-            except ModelFailure as again:
+            except (ModelFailure, NativeTransportInterrupted) as again:
+                if getattr(again, 'not_started', False):  # the note pushed it past the byte limit: report the rejection
+                    exc.transport_observation = first
+                    raise exc from None
                 again.transport_observation = {**(getattr(again, 'transport_observation', None) or {}),
                                                'repair_of': first}
                 raise
-            usage = getattr(exc, 'usage', None)
-            if isinstance(usage, dict) and isinstance(response.get('usage'), dict):
-                response['usage'] = {key: (usage.get(key, 0) + value if isinstance(value, int)
-                                           and isinstance(usage.get(key, 0), int) else value)
-                                     for key, value in response['usage'].items()}
             receipt.update(repair_of=first, inference_invocations_observed=2)
             return response, receipt
 
