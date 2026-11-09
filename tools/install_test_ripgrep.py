@@ -10,9 +10,10 @@ import urllib.request
 import zipfile
 
 
-def fetch(url, attempts=5, sleep=time.sleep):
-    """GitHub's release download answers 5xx or times out now and then (504s failed every shard on 2026-11-09);
-    a shard waits that out. A 4xx other than 429 is not transient and fails at once, like a digest mismatch."""
+def fetch(url, attempts=8, sleep=time.sleep):
+    """GitHub's release download answers 5xx or times out now and then (504s failed every shard on 2026-11-09 for
+    some minutes); a shard waits that out. A 4xx other than 429 is not transient and fails at once, like a digest
+    mismatch."""
     for attempt in range(attempts):
         try:
             with urllib.request.urlopen(url, timeout=60) as response:
@@ -21,7 +22,7 @@ def fetch(url, attempts=5, sleep=time.sleep):
             code = getattr(error, 'code', None)
             if (code is not None and code != 429 and code < 500) or attempt == attempts-1:
                 raise
-            sleep(2**(attempt+1))
+            sleep(min(2**(attempt+1), 60))  # some 3 minutes in all: the 504s of 2026-11-09 outlasted 30 s
 
 
 def main():

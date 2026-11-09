@@ -20,6 +20,11 @@ def test_a_transient_download_failure_is_retried_and_a_missing_asset_is_not(monk
         return io.BytesIO(answer)
     monkeypatch.setattr(installer.urllib.request, 'urlopen', urlopen)
     assert installer.fetch('https://example.test/a', sleep=slept.append) == b'archive' and slept == [2, 4]
+    answers[:] = [504]*8
+    with pytest.raises(urllib.error.HTTPError):
+        installer.fetch('https://example.test/a', sleep=slept.append)
+    assert slept[2:] == [2, 4, 8, 16, 32, 60, 60]  # about 3 minutes, then it gives up
+    del slept[2:]
     answers[:] = [404]
     with pytest.raises(urllib.error.HTTPError):
         installer.fetch('https://example.test/a', sleep=slept.append)
