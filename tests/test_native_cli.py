@@ -83,21 +83,31 @@ def test_updated_cli_checks_capabilities_and_preserves_boundary(
     body = native_cli.cli_request({'model': 'fixture', 'messages': [],
         'tools': [{'function': {'name': 'read', 'parameters': {}}}]}, structured=True, formatter=vendor == 'claude')
     if fault:
+        # An updated CLI that breaks the decoded shape fails its one probe: the real request is never sent.
         code = ('CLI_VERSION_UNAVAILABLE' if fault == 'bad_version' else
-                'CLI_BOUNDARY_UNCONFIRMED' if fault == 'boundary' else 'CLI_CAPABILITY_UNAVAILABLE')
+                'CLI_QUALIFICATION_FAILED' if fault == 'boundary' else 'CLI_CAPABILITY_UNAVAILABLE')
         with pytest.raises(ModelFailure, match=code) as caught:
             client.post_observed('', body, execution())
-        if fault != 'boundary':
-            assert caught.value.not_started
+        assert caught.value.not_started
+        if fault == 'boundary':
+            assert client.qualification[actual]['probe_code'] == 'CLI_BOUNDARY_UNCONFIRMED'
+            assert caught.value.transport_observation['qualification']['status'] == 'failed'
+            dispatched = len(calls)
+            with pytest.raises(ModelFailure, match='CLI_QUALIFICATION_FAILED'):
+                client.post_observed('', body, execution())  # recorded: no second probe, only --version
+            assert [argv[-1] for argv in calls[dispatched:]] == ['--version']
+        else:
             assert all(argv[-1] in {'--version', '--help'} for argv in calls)
         return
-    for _ in range(2):
-        _, receipt = client.post_observed('', body, execution())
+    receipts = [client.post_observed('', body, execution())[1] for _ in range(2)]
+    for receipt in receipts:
         assert receipt['client_version'] == actual
         assert receipt['reference_client_version'] == reference
         assert receipt['task_tools_executed'] == 0
+    assert receipts[0]['qualification']['status'] == 'probed' and 'qualification' not in receipts[1]
+    assert client.qualification[actual]['status'] == 'ok'
     assert sum('--help' in argv for argv in calls) == 1
-    assert sum('--version' in argv for argv in calls) == 2
+    assert sum('--version' in argv for argv in calls) == 4  # first call, its probe, the real request, second call
     assert client.version == reference
 
 
