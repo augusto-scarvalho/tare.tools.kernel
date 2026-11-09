@@ -19,6 +19,7 @@ import time
 from tare_tools_agent_runtime import ConversationRejected, ModelFailure
 from .managed_process import run_pipe_process
 from .native_models import encode, INVALID_CLI_REPLY, object_json, NativeTransportInterrupted
+from .native_counting import input_tokens
 
 INSTRUCTIONS = (
     'You are the inference component of Tare. The caller owns the workflow and executes all tools. '
@@ -142,6 +143,48 @@ def version_tuple(value):
 
 
 CLI_MINIMUM = {'cli://agy': '1.2.7', 'cli://claude': '2.1.278', 'cli://codex': '0.154.0'}
+# A probe failing with one of these says the CLI no longer answers in the shape this adapter decodes. Quota,
+# provider and transport failures say nothing about the shape and are never recorded as a verdict, nor is a
+# proposal outside the catalog: that is the model's content, not the CLI's shape.
+QUALIFICATION_SHAPE_FAILURES = frozenset({
+    'CLI_BOUNDARY_UNCONFIRMED', 'CLI_UNEXPECTED_TOOL', 'CLI_UNEXPECTED_INVOCATION', 'CLI_INCOMPLETE_RESPONSE',
+    'CLI_INVALID_RESPONSE', 'CLI_STRUCTURED_OUTPUT_REJECTED'})
+PROBE_TEXT = 'Reply with the text OK and no actions.'
+PROBE_SECONDS = 60  # a hung probe must leave the real request most of its time
+
+
+class _Unqualified(Exception):
+    """Internal: this CLI release and model need their probe before the real request (caught by post_observed)."""
+
+    def __init__(self, key):
+        super().__init__(key)
+        self.key = key
+
+
+def utc_now():
+    return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+
+
+def probe_body(body, endpoint=None):
+    """The real request with its conversation replaced by one short user record: the same CLI branch, schema and
+    decoder run (structured, native tools, summary or plain), at low effort and a few hundred tokens. None when
+    the envelope has no conversation to replace."""
+    try:
+        envelope = object_json(body['prompt'])
+    except (KeyError, TypeError, ValueError):
+        return None
+    key = next((k for k in ('conversation_records', 'messages') if isinstance(envelope.get(k), list)), None)
+    if key is None:
+        return None
+    kept = {k: v for k, v in envelope.items() if k not in (key, 'turn_constraints')}  # the catalog stays: same path
+    probe = {k: v for k, v in body.items() if k != 'reminder'}
+    if endpoint != 'cli://agy':  # an AGY model named for its tier (-high) accepts only that effort
+        probe['effort'] = 'low'
+    probe.update(prompt=encode({key: [{'role': 'user', 'content': PROBE_TEXT}], **kept}),
+                 system=('Answer the quoted user record. ' + PROBE_TEXT + ' Return one JSON object matching the '
+                         'response schema when one is given.' if 'response_schema' in body else
+                         'Answer the quoted user record. ' + PROBE_TEXT))
+    return probe
 # Check public isolation/transport switches for releases beyond the built-in
 # baselines. Response and hook checks still run on every call.
 CLI_SWITCHES = {
@@ -626,7 +669,7 @@ def decode_claude_native(rows, hooks, model, tools):
 
 class VendorCliClient:
     def __init__(self, endpoint, *, executable, version, timeout_seconds=120,
-                 request_byte_limit=1024*1024, model_catalog=None, **unused_transport):
+                 request_byte_limit=1024*1024, model_catalog=None, qualification=None, **unused_transport):
         if (endpoint not in CLI_MINIMUM or not Path(executable).is_absolute()
                 or Path(executable).suffix.lower() in {'.cmd', '.bat'} or not version):
             raise ValueError('explicit vendor executable and reference version required')
@@ -643,12 +686,81 @@ class VendorCliClient:
         self.request_byte_limit = min(request_byte_limit, AGY_REQUEST_BYTE_LIMIT) if endpoint == 'cli://agy' else request_byte_limit
         self._checked_versions = set({'cli://claude': ('2.1.278', '2.1.280'),
                                       'cli://agy': ('1.2.7',)}.get(endpoint, ()))
+        self._reference = set(self._checked_versions)  # qualified in code; any other version is probed once
+        # version -> {'status': 'ok'|'failed', ...}: the host may pass a persisted mapping so a machine probes a new
+        # CLI version once, not once per session.
+        self.qualification = {} if qualification is None else qualification
+        self._probing, self._passed = set(), set()  # _passed: this session's verdicts, whatever the store
         self._codex_features = {}
 
     def post(self, path, body, control):
         return self.post_observed(path, body, control)[0]
 
     def post_observed(self, path, body, control):
+        """A CLI release the adapter has not seen first answers one tiny probe through this same path, per model,
+        before the real request is sent: a CLI update that broke the shape it decodes stops here with a clear code
+        instead of blocking a session halfway (AGY 1.2.7 -> 1.5.3, 2026-11-09). Only shape failures are a verdict;
+        the probe's facts go with the real call that paid for it, also when that call fails."""
+        probed = None
+        try:
+            return self._repaired(path, body, control)
+        except _Unqualified as pending:
+            probed = self._qualify(pending.key, path, body, control)
+        try:
+            response, receipt = self._repaired(path, body, control)
+        except (ModelFailure, NativeTransportInterrupted) as exc:
+            if probed is not None:
+                exc.transport_observation = {**(getattr(exc, 'transport_observation', None) or {}),
+                                             'qualification': probed}
+            raise
+        if probed is not None:
+            receipt['qualification'] = probed
+        return response, receipt
+
+    def _remember(self, key, record):
+        try:
+            self.qualification[key] = record
+        except Exception:  # a host store that cannot be written loses the verdict, never the call
+            pass
+
+    def _qualify(self, key, path, body, control):
+        version, model = key.split(' ', 1)
+        probe = probe_body(body, self.endpoint)
+        if probe is None:  # no conversation to replace: nothing safe to probe with, so this session's call decides
+            self._passed.add(key)
+            return {'version': version, 'model': model, 'status': 'unprobed'}
+        self._probing.add(key)
+        limit, self.timeout_seconds = self.timeout_seconds, min(self.timeout_seconds, PROBE_SECONDS)
+        try:
+            response, receipt = self._repaired(path, probe, control)
+        except (NativeTransportInterrupted, _Unqualified) as exc:  # the user's request was never sent: say so
+            failure = ModelFailure('CLI_QUALIFICATION_INTERRUPTED', not_started=True, retryable=True)
+            failure.transport_observation = {**(getattr(exc, 'transport_observation', None) or {}),
+                                             'qualification': {'version': version, 'model': model,
+                                                               'status': 'interrupted'}}
+            raise failure from None
+        except ModelFailure as exc:
+            if exc.code not in QUALIFICATION_SHAPE_FAILURES:
+                raise  # a quota or provider failure of the probe is no verdict: its own code and handling stand
+            record = {'status': 'failed', 'at': utc_now(), 'model': model, 'probe_code': exc.code,
+                      'detail': str(getattr(exc, 'final_action_error', '') or '')[:300],
+                      'probe_usage': getattr(exc, 'usage', None)}
+            self._remember(key, record)
+            failure = ModelFailure('CLI_QUALIFICATION_FAILED', not_started=True)
+            failure.transport_observation = {**(getattr(exc, 'transport_observation', None) or {}),
+                                             'qualification': {**record, 'version': version}}
+            raise failure from None
+        finally:
+            self._probing.discard(key)
+            self.timeout_seconds = limit
+        # Unreadable usage only degrades counting to the byte estimate, so it is noted, not a verdict.
+        readable = input_tokens('vendor-cli', self.endpoint, response.get('usage')) is not None
+        self._passed.add(key)
+        self._remember(key, {'status': 'ok', 'at': utc_now(), 'model': model, 'usage_readable': readable})
+        return {'version': version, 'model': model, 'status': 'probed', 'probe_usage': response.get('usage'),
+                'probe_invocations': receipt.get('inference_invocations_observed', 1)}
+
+    def _repaired(self, path, body, control):
         """One exchange, repaired once when the CLI itself rejected the final action (AGY 1.5.3 no longer lets the
         model correct it in the same run). The repair names the rejection to the model, which a plain retry of the
         same request could not. The response keeps the repair's own usage: for vendor CLIs it is the measured size
@@ -738,6 +850,14 @@ class VendorCliClient:
                         receipt['missing_cli_switches'] = missing
                         raise ModelFailure('CLI_CAPABILITY_UNAVAILABLE', not_started=True)
                     self._checked_versions.add(actual)
+                key = actual + ' ' + str(body.get('model'))  # per release and model: one model's slip is not all
+                record = self.qualification.get(key) if actual not in self._reference else {'status': 'ok'}
+                if isinstance(record, dict) and record.get('status') == 'failed':  # known broken: no probe, no call
+                    receipt['qualification'] = {**record, 'version': actual, 'status': 'recorded_failed'}
+                    raise ModelFailure('CLI_QUALIFICATION_FAILED', not_started=True)
+                if (not (isinstance(record, dict) and record.get('status') == 'ok')
+                        and key not in self._probing and key not in self._passed):
+                    raise _Unqualified(key)
                 if self.endpoint == 'cli://codex':
                     from .native_cli_codex import discover
                     if actual not in self._codex_features:
@@ -971,7 +1091,7 @@ class VendorCliClient:
                     receipt['final_action_error'] = exc.final_action_error
                 exc.transport_observation = receipt
                 raise
-            except NativeTransportInterrupted:
+            except (NativeTransportInterrupted, _Unqualified):
                 raise
             except Exception as exc:
                 receipt['decode_error_type'] = type(exc).__name__

@@ -53,7 +53,9 @@ def test_updated_agy_rejection_reports_only_allowlisted_step_names(tmp_path,monk
               {'event':'result','result':{'status':'SUCCESS','structured_output':{'text':'ok','actions':[]}}}]
         return physical,'\n'.join(json.dumps(r) for r in rows).encode(),b''
     monkeypatch.setattr(native_cli,'run_pipe_process',process)
-    client=native_cli.VendorCliClient('cli://agy',executable=str(tmp_path/'agy.exe'),version='1.4.7')
+    from tests.test_native_models import AnyQualified
+    client=native_cli.VendorCliClient('cli://agy',executable=str(tmp_path/'agy.exe'),version='1.4.7',
+                                     qualification=AnyQualified())
     body=native_cli.cli_request({'model':'fixture','messages':[],'tools':[
         {'function':{'name':'read','parameters':{'type':'object'}}}]},structured=True)
     with pytest.raises(ModelFailure,match='CLI_UNEXPECTED_TOOL') as caught:

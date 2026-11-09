@@ -699,3 +699,10 @@ def test_bedrock_counter_can_bind_documented_base_model_without_changing_inferen
 def test_counter_route_is_never_inferred_or_silently_aliased(protocol, model, source):
     with pytest.raises(ValueError):
         replace(profile(protocol), count_model=model, count_model_source=source)
+
+
+class AnyQualified(dict):
+    """For tests about another concern: every vendor CLI version counts as already qualified (no probe)."""
+
+    def get(self, key, default=None):
+        return {'status': 'ok'}

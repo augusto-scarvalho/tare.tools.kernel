@@ -2,6 +2,8 @@
 import json
 from pathlib import Path
 import pytest
+
+from tests.test_native_models import AnyQualified
 from tare_tools_agent_runtime import ModelFailure
 from compute_plane import native_cli
 from compute_plane.native_cli_codex import ENABLED_FEATURES, REQUIRED_FEATURES
@@ -89,7 +91,7 @@ def test_codex_upgrade_discovers_disables_and_checks_features(tmp_path, monkeypa
         return physical,'\n'.join(json.dumps(r) for r in rows).encode(),b''
     monkeypatch.setattr(native_cli,'run_pipe_process',process)
     client=native_cli.VendorCliClient('cli://codex',executable=str(tmp_path/'codex.exe'),
-                                     version=reference,model_catalog={'slug':'fixture'})
+                                     version=reference,model_catalog={'slug':'fixture'},qualification=AnyQualified())
     body=native_cli.cli_request({'model':'fixture','messages':[]})
     if fault:
         with pytest.raises(ModelFailure,match='CLI_BOUNDARY_UNCONFIRMED' if fault=='tool' else 'CLI_CAPABILITY_UNAVAILABLE') as caught:
@@ -141,7 +143,7 @@ def test_codex_refuses_a_call_its_users_global_instructions_would_reach(tmp_path
         return physical, '\n'.join(json.dumps(r) for r in rows).encode(), b''
     monkeypatch.setattr(native_cli, 'run_pipe_process', process)
     client = native_cli.VendorCliClient('cli://codex', executable=str(tmp_path/'codex.exe'), version='0.157.0',
-                                        model_catalog={'slug': 'fixture'})
+                                        model_catalog={'slug': 'fixture'}, qualification=AnyQualified())
     body = native_cli.cli_request({'model': 'fixture', 'messages': []})
     if refused:
         with pytest.raises(ModelFailure, match='CLI_USER_INSTRUCTIONS_PRESENT') as caught:

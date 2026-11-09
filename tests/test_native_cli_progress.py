@@ -26,7 +26,9 @@ def test_incomplete_agy_keeps_safe_progress_without_accepting_a_captured_proposa
         raw=json.dumps({'event':'step_update','step_update':{'tool_info':{'name':'finish','args':'PRIVATE-ARGS'}}}).encode()
         return {**physical,'timeout':True,'exit_code':None},raw+b'\n{"event":',b'PRIVATE-STDERR'
     monkeypatch.setattr(native_cli,'run_pipe_process',process)
-    client=native_cli.VendorCliClient('cli://agy',executable=str(tmp_path/'agy.exe'),version='1.2.7')
+    from tests.test_native_models import AnyQualified
+    client=native_cli.VendorCliClient('cli://agy',executable=str(tmp_path/'agy.exe'),version='1.2.7',
+                                     qualification=AnyQualified())
     body=native_cli.cli_request({'model':'fixture','messages':[],
         'tools':[{'function':{'name':'read','parameters':{}}}]},structured=True)
     with pytest.raises(NativeTransportInterrupted) as caught:client.post_observed('',body,execution())
