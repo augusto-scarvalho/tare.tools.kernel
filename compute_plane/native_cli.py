@@ -449,6 +449,21 @@ def decode_agy(rows, hooks, model, *, structured=False):
     if any(r.get('event') == 'step_update' and r['step_update'].get('tool_info')
            and not ((final_action or schema_finish) and r['step_update']['tool_info'].get('name') == 'finish') for r in rows):
         raise ModelFailure('CLI_UNEXPECTED_TOOL')
+    # AGY 1.5.3 validates the final action itself and marks finish ERROR when the model broke the schema, yet still
+    # reports SUCCESS with the invalid reply: a reply without its required 'text' blocked a TUI session on
+    # 2026-11-09. Earlier versions let the model correct it in the same run. Nothing ran, so the call is retried.
+    finishes = [r['step_update'] for r in rows if r.get('event') == 'step_update'
+                and isinstance(r.get('step_update'), dict) and isinstance(r['step_update'].get('tool_info'), dict)
+                and r['step_update']['tool_info'].get('name') == 'finish']
+    # Only the last finish decides: a version that lets the model correct itself in the run ends with a good one.
+    # With a tool hook, finish shows ERROR because Tare's own hook denied it, so only schema_finish counts.
+    if schema_finish and finishes and finishes[-1].get('state') == 'ERROR':
+        failure = ModelFailure('CLI_INVALID_RESPONSE', retryable=True)
+        error = finishes[-1]['tool_info'].get('error')
+        failure.final_action_error = str((error if isinstance(error, dict) else {}).get('message', ''))[:300]
+        finished = [r['result'] for r in rows if r.get('event') == 'result' and isinstance(r.get('result'), dict)]
+        failure.usage = finished[0].get('usage') if len(finished) == 1 else None  # the rejected attempt was paid
+        raise failure
     results = [r['result'] for r in rows if r.get('event') == 'result']
     if len(results) != 1:
         raise ModelFailure('CLI_GENERATION_FAILED')
@@ -634,6 +649,32 @@ class VendorCliClient:
         return self.post_observed(path, body, control)[0]
 
     def post_observed(self, path, body, control):
+        """One exchange, repaired once when the CLI itself rejected the final action (AGY 1.5.3 no longer lets the
+        model correct it in the same run). The repair names the rejection to the model, which a plain retry of the
+        same request could not. The response keeps the repair's own usage: for vendor CLIs it is the measured size
+        of one request (the count anchor), so the first attempt's usage stays in the receipt's `repair_of`."""
+        try:
+            return self._exchange(path, body, control)
+        except ModelFailure as exc:
+            rejected = getattr(exc, 'final_action_error', None)
+            if not isinstance(rejected, str) or control.should_stop():
+                raise
+            first = {**(getattr(exc, 'transport_observation', None) or {}), 'usage': getattr(exc, 'usage', None)}
+            note = ('\n\nYour previous reply was rejected before any action ran: ' + (rejected or 'invalid final action')
+                    + '\nSend that decision again as one JSON object with exactly the properties the schema requires.')
+            try:
+                response, receipt = self._exchange(path, {**body, 'reminder': body.get('reminder', '') + note}, control)
+            except (ModelFailure, NativeTransportInterrupted) as again:
+                if getattr(again, 'not_started', False):  # the note pushed it past the byte limit: report the rejection
+                    exc.transport_observation = {**first, 'repair_not_started': again.code}
+                    raise exc from None
+                again.transport_observation = {**(getattr(again, 'transport_observation', None) or {}),
+                                               'repair_of': first}
+                raise
+            receipt.update(repair_of=first, inference_invocations_observed=2)
+            return response, receipt
+
+    def _exchange(self, path, body, control):
         receipt = {'transport': 'official_vendor_cli', 'started': False, 'cleanup_verified': True,
                    'remote_stop': 'not_dispatched', 'backend_attempts': None,
                    'vendor': self.endpoint.split('://')[1], 'client_version': None,
@@ -926,6 +967,8 @@ class VendorCliClient:
                     receipt['usage_limit'] = exc.usage_limit
                 if isinstance(getattr(exc, 'proposed_action_count', None), int):
                     receipt['proposed_action_count'] = exc.proposed_action_count
+                if isinstance(getattr(exc, 'final_action_error', None), str):
+                    receipt['final_action_error'] = exc.final_action_error
                 exc.transport_observation = receipt
                 raise
             except NativeTransportInterrupted:
