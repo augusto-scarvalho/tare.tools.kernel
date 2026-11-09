@@ -368,7 +368,7 @@ class MediatedTools:
                                  'use line numbers from search or read from start=1')
             selected, size = [], 0
             for i in range(start - 1, min(end, len(lines))):
-                if not selected and ('start_column' in args or len((f'{i+1}|'+lines[i]).encode()) > 24000):
+                if not selected and (column > 1 or len((f'{i+1}|'+lines[i]).encode()) > 24000):  # column 1 is a page
                     if column > max(1, len(lines[i])):
                         raise ValueError('read_column_outside_line')
                     prefix = f'{i+1}|'

@@ -4,6 +4,7 @@ Notable changes to `tare.tools.kernel` are recorded here, newest first.
 
 ## Unreleased
 
+- A read with `start_column: 1` returns a page again, not one line: models fill that default from the schema, and a DeepSeek implementer got a single line per read, repeated the read and was stopped for no progress. Column mode is for continuing a line from a later column or reading a line longer than a page.
 - The provider reason drops every request header value a gateway might echo (account and session ids too), not only those named like credentials; Content-Type, Accept, Content-Length and User-Agent are kept.
 
 - A refused HTTP request (4xx other than 429) keeps the provider's reason in its transport receipt as `provider_error` (error type and at most 300 characters of message), after the worker removes every credential header value and anything shaped like a key. Only the status was kept, so an Anthropic HTTP 400 could not be told apart (thinking signature, parameter or size). 429 and 5xx replies still keep only Retry-After and a known busy reason.
