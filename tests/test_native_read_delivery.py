@@ -68,6 +68,14 @@ def test_long_line_pages_reconstruct_exact_unicode_without_omission_or_more_than
     assert tail['text']=='2|last'
 
 
+def test_column_one_reads_a_page_not_one_line(setup):
+    root,_,tools,control=setup
+    # Models fill start_column=1 from the schema; that read is a page, or each read returns one line and stalls them.
+    (root/'a.py').write_text(''.join(f'line {i}\n' for i in range(1,301)))
+    page=json.loads(call(tools,control,'read',repository='repo',path='a.py',start=100,start_column=1).output_json)
+    assert page['start']==100 and page['end']==299 and page['next_start']==300 and 'partial_line' not in page
+
+
 @pytest.mark.parametrize('column',[0,-1,True,1.5,9999])
 def test_invalid_column_never_attests_unread_content(setup,column):
     _,_,tools,control=setup
