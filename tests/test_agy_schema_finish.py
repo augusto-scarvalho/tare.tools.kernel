@@ -101,6 +101,7 @@ def test_a_final_action_the_cli_rejected_is_repaired_once_naming_the_rejection(t
     with pytest.raises(ModelFailure) as full:
         client.post_observed('', request, execution())
     assert full.value.code == 'CLI_INVALID_RESPONSE' and full.value.retryable  # the note did not fit: the rejection
+    assert full.value.transport_observation['repair_not_started'] == 'CLI_INPUT_BYTE_LIMIT_EXCEEDED'
 
     sent.clear()
     answers[:] = [ModelFailure('CLI_GENERATION_FAILED')]

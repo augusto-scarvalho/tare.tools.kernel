@@ -666,7 +666,7 @@ class VendorCliClient:
                 response, receipt = self._exchange(path, {**body, 'reminder': body.get('reminder', '') + note}, control)
             except (ModelFailure, NativeTransportInterrupted) as again:
                 if getattr(again, 'not_started', False):  # the note pushed it past the byte limit: report the rejection
-                    exc.transport_observation = first
+                    exc.transport_observation = {**first, 'repair_not_started': again.code}
                     raise exc from None
                 again.transport_observation = {**(getattr(again, 'transport_observation', None) or {}),
                                                'repair_of': first}
