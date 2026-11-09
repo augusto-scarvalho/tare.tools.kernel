@@ -363,6 +363,9 @@ class MediatedTools:
                 self.reads[key] = sha
                 return {**result, 'sha256': sha}
             lines = raw.decode("utf-8").splitlines()
+            # Lines drop the file's last line break; a page that reaches the end says whether there is one, so a
+            # model does not "add" a newline the file already has (Claude Haiku 5.5 did, 2026-11-09).
+            ending = {'final_newline': raw.endswith((b'\n', b'\r'))}
             if start > len(lines) and (lines or start != 1):
                 raise ValueError(f'read_range_outside_file: file has {len(lines)} lines; '
                                  'use line numbers from search or read from start=1')
@@ -384,7 +387,8 @@ class MediatedTools:
                         'start_column': column, 'end_column': last_column,
                         'partial_line': column > 1 or unfinished,
                         'truncated': unfinished or i+1 < min(requested_end, len(lines)),
-                        'next_start': next_line, 'next_start_column': last_column+1 if unfinished else None}
+                        'next_start': next_line, 'next_start_column': last_column+1 if unfinished else None,
+                        **(ending if next_line is None else {})}
                 line = f'{i + 1}|{lines[i]}'
                 length = len(line.encode()) + bool(selected)
                 if size + length > 24000:
@@ -398,7 +402,8 @@ class MediatedTools:
                     'start': start, 'end': actual_end,
                     'requested_end': requested_end,
                     'truncated': actual_end < min(requested_end, len(lines)),
-                    'next_start': actual_end+1 if actual_end < len(lines) else None}
+                    'next_start': actual_end+1 if actual_end < len(lines) else None,
+                    **(ending if actual_end >= len(lines) else {})}
         if name == 'edit':
             args = edit_args(args)
         deleting = name == 'edit' and args.get('delete', False) is True

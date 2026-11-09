@@ -60,6 +60,8 @@ TOOL_SPECS = {
         'Pages contain at most 200 lines and 24000 bytes; larger ranges return a partial page. '
         'Omit end for a page of up to 200 lines from start. '
         'Use returned start/end and next_start to see what was actually read; a page is not the whole file. '
+        'A page that reaches the end of the file has final_newline: whether the file ends with a line break, which '
+        'the numbered lines do not show; keep it as it is unless the task changes it. '
         'Long lines return partial_line and 1-based Unicode character columns. Continue at next_start '
         'with next_start_column as start_column; a partial line is not whole-line coverage.',
         {'repository': TEXT, 'path': TEXT,
