@@ -4,7 +4,8 @@ Notable changes to `tare.tools.kernel` are recorded here, newest first.
 
 ## Unreleased
 
-- The CI test-tool download (ripgrep from GitHub's releases) retries a 5xx, 429, reset or timeout for about three minutes (eight tries, backoff capped at a minute): on 2026-11-09 504s for some minutes failed every shard of several runs. A 404 or a digest mismatch still fails at once.
+- The test-tool download waits out an outage of some minutes, not 30 seconds: eight tries with backoff capped at a minute (about three minutes). The first window ran out on this change's own Windows run, eight 504s in 42 seconds.
+- The CI test-tool download (ripgrep from GitHub's releases) retries a 5xx, 429, reset or timeout up to five times with backoff: on 2026-11-09 one 504 failed every shard of several runs. A 404 or a digest mismatch still fails at once.
 - A read with `start_column: 1` returns a page again, not one line: models fill that default from the schema, and a DeepSeek implementer got a single line per read, repeated the read and was stopped for no progress. Column mode is for continuing a line from a later column or reading a line longer than a page.
 - The provider reason drops every request header value a gateway might echo (account and session ids too), not only those named like credentials; Content-Type, Accept, Content-Length and User-Agent are kept.
 
