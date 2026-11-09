@@ -150,21 +150,22 @@ QUALIFICATION_SHAPE_FAILURES = frozenset({
     'CLI_BOUNDARY_UNCONFIRMED', 'CLI_UNEXPECTED_TOOL', 'CLI_UNEXPECTED_INVOCATION', 'CLI_INCOMPLETE_RESPONSE',
     'CLI_INVALID_RESPONSE', 'CLI_STRUCTURED_OUTPUT_REJECTED'})
 PROBE_TEXT = 'Reply with the text OK and no actions.'
+PROBE_SECONDS = 60  # a hung probe must leave the real request most of its time
 
 
 class _Unqualified(Exception):
-    """Internal: this CLI version needs its probe before the real request (caught by post_observed)."""
+    """Internal: this CLI release and model need their probe before the real request (caught by post_observed)."""
 
-    def __init__(self, version):
-        super().__init__(version)
-        self.version = version
+    def __init__(self, key):
+        super().__init__(key)
+        self.key = key
 
 
 def utc_now():
     return time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
 
 
-def probe_body(body):
+def probe_body(body, endpoint=None):
     """The real request with its conversation replaced by one short user record: the same CLI branch, schema and
     decoder run (structured, native tools, summary or plain), at low effort and a few hundred tokens. None when
     the envelope has no conversation to replace."""
@@ -177,7 +178,9 @@ def probe_body(body):
         return None
     kept = {k: v for k, v in envelope.items() if k not in (key, 'turn_constraints')}  # the catalog stays: same path
     probe = {k: v for k, v in body.items() if k != 'reminder'}
-    probe.update(effort='low', prompt=encode({key: [{'role': 'user', 'content': PROBE_TEXT}], **kept}),
+    if endpoint != 'cli://agy':  # an AGY model named for its tier (-high) accepts only that effort
+        probe['effort'] = 'low'
+    probe.update(prompt=encode({key: [{'role': 'user', 'content': PROBE_TEXT}], **kept}),
                  system=('Answer the quoted user record. ' + PROBE_TEXT + ' Return one JSON object matching the '
                          'response schema when one is given.' if 'response_schema' in body else
                          'Answer the quoted user record. ' + PROBE_TEXT))
@@ -687,56 +690,75 @@ class VendorCliClient:
         # version -> {'status': 'ok'|'failed', ...}: the host may pass a persisted mapping so a machine probes a new
         # CLI version once, not once per session.
         self.qualification = {} if qualification is None else qualification
-        self._probing, self._probed = set(), None
+        self._probing, self._passed = set(), set()  # _passed: this session's verdicts, whatever the store
         self._codex_features = {}
 
     def post(self, path, body, control):
         return self.post_observed(path, body, control)[0]
 
     def post_observed(self, path, body, control):
-        """A CLI version the adapter has not seen first answers one tiny probe through this same path, before the
-        real request is sent: a CLI update that broke the shape it decodes stops here with a clear code instead of
-        blocking a session halfway (AGY 1.2.7 -> 1.5.3, 2026-11-09). Only shape failures are a verdict."""
+        """A CLI release the adapter has not seen first answers one tiny probe through this same path, per model,
+        before the real request is sent: a CLI update that broke the shape it decodes stops here with a clear code
+        instead of blocking a session halfway (AGY 1.2.7 -> 1.5.3, 2026-11-09). Only shape failures are a verdict;
+        the probe's facts go with the real call that paid for it, also when that call fails."""
+        probed = None
+        try:
+            return self._repaired(path, body, control)
+        except _Unqualified as pending:
+            probed = self._qualify(pending.key, path, body, control)
         try:
             response, receipt = self._repaired(path, body, control)
-        except _Unqualified as pending:
-            self._qualify(pending.version, path, body, control)
-            response, receipt = self._repaired(path, body, control)
-        if self._probed is not None:
-            receipt['qualification'], self._probed = self._probed, None
+        except (ModelFailure, NativeTransportInterrupted) as exc:
+            if probed is not None:
+                exc.transport_observation = {**(getattr(exc, 'transport_observation', None) or {}),
+                                             'qualification': probed}
+            raise
+        if probed is not None:
+            receipt['qualification'] = probed
         return response, receipt
 
-    def _qualify(self, version, path, body, control):
-        probe = probe_body(body)
-        if probe is None:  # no conversation to replace: nothing safe to probe with, so the real call decides
-            self.qualification[version] = {'status': 'ok', 'basis': 'unprobed', 'at': utc_now()}
-            return
-        self._probing.add(version)
+    def _remember(self, key, record):
+        try:
+            self.qualification[key] = record
+        except Exception:  # a host store that cannot be written loses the verdict, never the call
+            pass
+
+    def _qualify(self, key, path, body, control):
+        version, model = key.split(' ', 1)
+        probe = probe_body(body, self.endpoint)
+        if probe is None:  # no conversation to replace: nothing safe to probe with, so this session's call decides
+            self._passed.add(key)
+            return {'version': version, 'model': model, 'status': 'unprobed'}
+        self._probing.add(key)
+        limit, self.timeout_seconds = self.timeout_seconds, min(self.timeout_seconds, PROBE_SECONDS)
         try:
             response, receipt = self._repaired(path, probe, control)
-        except NativeTransportInterrupted as exc:  # the user's request was never sent: say so, not "uncertain"
+        except (NativeTransportInterrupted, _Unqualified) as exc:  # the user's request was never sent: say so
             failure = ModelFailure('CLI_QUALIFICATION_INTERRUPTED', not_started=True, retryable=True)
-            failure.transport_observation = {**(exc.transport_observation or {}), 'qualification_probe': version}
+            failure.transport_observation = {**(getattr(exc, 'transport_observation', None) or {}),
+                                             'qualification': {'version': version, 'model': model,
+                                                               'status': 'interrupted'}}
             raise failure from None
         except ModelFailure as exc:
             if exc.code not in QUALIFICATION_SHAPE_FAILURES:
-                exc.not_started = True  # a quota or provider failure of the probe, not a verdict on the shape
-                raise
-            record = {'status': 'failed', 'at': utc_now(), 'model': body.get('model'), 'probe_code': exc.code,
-                      'detail': str(getattr(exc, 'final_action_error', '') or '')[:300]}
-            self.qualification[version] = record
+                raise  # a quota or provider failure of the probe is no verdict: its own code and handling stand
+            record = {'status': 'failed', 'at': utc_now(), 'model': model, 'probe_code': exc.code,
+                      'detail': str(getattr(exc, 'final_action_error', '') or '')[:300],
+                      'probe_usage': getattr(exc, 'usage', None)}
+            self._remember(key, record)
             failure = ModelFailure('CLI_QUALIFICATION_FAILED', not_started=True)
             failure.transport_observation = {**(getattr(exc, 'transport_observation', None) or {}),
                                              'qualification': {**record, 'version': version}}
             raise failure from None
         finally:
-            self._probing.discard(version)
+            self._probing.discard(key)
+            self.timeout_seconds = limit
         # Unreadable usage only degrades counting to the byte estimate, so it is noted, not a verdict.
         readable = input_tokens('vendor-cli', self.endpoint, response.get('usage')) is not None
-        self.qualification[version] = {'status': 'ok', 'at': utc_now(), 'model': body.get('model'),
-                                       'usage_readable': readable}
-        self._probed = {'version': version, 'status': 'probed', 'probe_usage': response.get('usage'),
-                        'probe_invocations': receipt.get('inference_invocations_observed', 1)}
+        self._passed.add(key)
+        self._remember(key, {'status': 'ok', 'at': utc_now(), 'model': model, 'usage_readable': readable})
+        return {'version': version, 'model': model, 'status': 'probed', 'probe_usage': response.get('usage'),
+                'probe_invocations': receipt.get('inference_invocations_observed', 1)}
 
     def _repaired(self, path, body, control):
         """One exchange, repaired once when the CLI itself rejected the final action (AGY 1.5.3 no longer lets the
@@ -828,12 +850,14 @@ class VendorCliClient:
                         receipt['missing_cli_switches'] = missing
                         raise ModelFailure('CLI_CAPABILITY_UNAVAILABLE', not_started=True)
                     self._checked_versions.add(actual)
-                record = self.qualification.get(actual) if actual not in self._reference else {'status': 'ok'}
+                key = actual + ' ' + str(body.get('model'))  # per release and model: one model's slip is not all
+                record = self.qualification.get(key) if actual not in self._reference else {'status': 'ok'}
                 if isinstance(record, dict) and record.get('status') == 'failed':  # known broken: no probe, no call
                     receipt['qualification'] = {**record, 'version': actual, 'status': 'recorded_failed'}
                     raise ModelFailure('CLI_QUALIFICATION_FAILED', not_started=True)
-                if not (isinstance(record, dict) and record.get('status') == 'ok') and actual not in self._probing:
-                    raise _Unqualified(actual)
+                if (not (isinstance(record, dict) and record.get('status') == 'ok')
+                        and key not in self._probing and key not in self._passed):
+                    raise _Unqualified(key)
                 if self.endpoint == 'cli://codex':
                     from .native_cli_codex import discover
                     if actual not in self._codex_features:

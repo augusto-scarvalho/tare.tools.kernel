@@ -348,14 +348,18 @@ The 2026-09-20 vendor increment adds two explicit protocols:
   Claude 2.1.278, Claude 2.1.280 for structured output/Opus 5.5, and Claude
   2.1.293 for Haiku 5.5 (including structured output). Receipts record
   both reference and actual versions without rewriting saved deployment identity.
-  A release the adapter has not seen first answers one probe before the real
-  request: the same request with its conversation replaced by one short record, at
-  low effort, through the same branch, decoder and one-time repair. A shape failure
-  (boundary, invocation, tool or decode) is recorded and returns
+  A release the adapter has not seen first answers one probe per model before the
+  real request: the same request with its conversation replaced by one short record
+  (low effort, except AGY, whose tier-named models accept only their own effort; at
+  most 60 seconds), through the same branch, decoder and one-time repair. A shape
+  failure (boundary, invocation, tool or decode) is recorded and returns
   CLI_QUALIFICATION_FAILED, not started, now and on later calls without a new probe;
-  quota, provider and transport failures are no verdict. The host may pass a
-  persisted `qualification` mapping (version -> record) so a machine probes a
-  release once; receipts carry `qualification` on the call that probed.
+  a probe cut short returns CLI_QUALIFICATION_INTERRUPTED, not started and
+  retryable. Quota and provider failures of the probe keep their own code and are no
+  verdict. The host may pass a persisted `qualification` mapping ("version model" ->
+  record) so a machine probes a release once per model; a store that cannot be
+  written loses the verdict, never the call. The probe's facts (`qualification`)
+  go with the real call that paid for it, also when that call fails.
   Opus 5.5 decisions use the existing toolless JSON protocol from the outset: its
   formatter can answer in text instead of invoking StructuredOutput and hit a CLI
   turn limit. Failed results are never accepted or automatically retried. Other

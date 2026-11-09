@@ -90,7 +90,7 @@ def test_updated_cli_checks_capabilities_and_preserves_boundary(
             client.post_observed('', body, execution())
         assert caught.value.not_started
         if fault == 'boundary':
-            assert client.qualification[actual]['probe_code'] == 'CLI_BOUNDARY_UNCONFIRMED'
+            assert client.qualification[actual + ' fixture']['probe_code'] == 'CLI_BOUNDARY_UNCONFIRMED'
             assert caught.value.transport_observation['qualification']['status'] == 'failed'
             dispatched = len(calls)
             with pytest.raises(ModelFailure, match='CLI_QUALIFICATION_FAILED'):
@@ -105,7 +105,7 @@ def test_updated_cli_checks_capabilities_and_preserves_boundary(
         assert receipt['reference_client_version'] == reference
         assert receipt['task_tools_executed'] == 0
     assert receipts[0]['qualification']['status'] == 'probed' and 'qualification' not in receipts[1]
-    assert client.qualification[actual]['status'] == 'ok'
+    assert client.qualification[actual + ' fixture']['status'] == 'ok'
     assert sum('--help' in argv for argv in calls) == 1
     assert sum('--version' in argv for argv in calls) == 4  # first call, its probe, the real request, second call
     assert client.version == reference
