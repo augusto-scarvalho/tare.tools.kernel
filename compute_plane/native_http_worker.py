@@ -66,10 +66,11 @@ def busy_hints(exc, body=None):
     return hints
 
 def provider_error(status, body, headers):
-    """A refused request's own reason (4xx other than 429): the provider's error type and message, so an HTTP 400
-    can be diagnosed. Every request header value (but the plain content ones) and anything shaped like a key is
-    removed from the message first; a gateway's 429 or 5xx text may echo anything and stays out."""
-    if not 400 <= status < 500 or status == 429:
+    """A refused request's own reason: the provider's error type and message, so an HTTP 400 can be diagnosed. Every
+    request header value (but the plain content ones) and anything shaped like a key is removed from the message
+    first. A 429 keeps only its error type, a single word, which tells a spent plan (OpenCode's GoUsageLimitError)
+    from a passing rate limit; a gateway's 429 or 5xx text may echo anything and stays out."""
+    if not 400 <= status < 500:
         return {}
     try:
         error = json.loads(body).get('error')
@@ -81,6 +82,8 @@ def provider_error(status, body, headers):
     kind = error.get('type') or error.get('code')
     if isinstance(kind, str) and re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', kind):
         found['type'] = kind
+    if status == 429:
+        return {'provider_error': found} if found else {}
     message = error.get('message')
     if isinstance(message, str) and message.strip():
         for name, value in headers.items():
