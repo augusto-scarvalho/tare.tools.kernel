@@ -56,7 +56,9 @@ class CodexFileAuth:
 class CodexHttpClient(NativeHttpClient):
     """Keep the subscription's HTTP cache affinity aligned with the wire key."""
 
-    def post_observed(self, path, body, control, *, stream_protocol=None, on_event=None):
+    def post_observed(self, path, body, control, *, stream_protocol=None, on_event=None, headers=None):
+        exchange_headers = headers
+
         def headers():
             values = self.request_headers() if self.request_headers is not None else {}
             if path == '/responses' and isinstance(body, dict) and 'prompt_cache_key' in body:
@@ -70,7 +72,7 @@ class CodexHttpClient(NativeHttpClient):
             read_timeout_seconds=self.read_timeout_seconds,
             request_byte_limit=self.request_byte_limit)
         return exchange.post_observed(path, body, control,
-            stream_protocol=stream_protocol, on_event=on_event)
+            stream_protocol=stream_protocol, on_event=on_event, headers=exchange_headers)
 
 
 def client(path, *, account_id=None, **transport):

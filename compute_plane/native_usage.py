@@ -28,7 +28,7 @@ class UsageContract:
 
     def __post_init__(self):
         if self.layout not in {"chat-inclusive", "gemini-chat", "openrouter-inclusive", "openrouter-responses-inclusive", "responses-inclusive", "converse-exclusive",
-                               "anthropic-exclusive", "claude-cli-exclusive", "codex-cli-inclusive", "agy-cli-exclusive"} or not self.source.strip():
+                               "anthropic-exclusive", "opencode-exclusive", "claude-cli-exclusive", "codex-cli-inclusive", "agy-cli-exclusive"} or not self.source.strip():
             raise ValueError("explicit per-request usage contract and source required")
 
 
@@ -132,6 +132,15 @@ def normalize_usage(raw, contract: UsageContract | None):
             problems.append('total_mismatch')
         if declared is not None and reasoning is not None and declared != reasoning:
             problems.append('reasoning_mismatch')
+    elif contract.layout == 'opencode-exclusive':
+        # OpenCode reports disjoint categories under usage.opencode.tokens for every API family: input excludes
+        # cache reads and writes, output includes reasoning. The family's own counters stay raw evidence only.
+        uncached, out = read('opencode', 'tokens', 'input'), read('opencode', 'tokens', 'output')
+        cached = read('opencode', 'tokens', 'cache_read')
+        short, hour = read('opencode', 'tokens', 'cache_write_5m'), read('opencode', 'tokens', 'cache_write_1h')
+        write = short + hour if None not in (short, hour) else None
+        inp = uncached + cached + write if None not in (uncached, cached, write) else None
+        reasoning, provider_total = read('opencode', 'tokens', 'reasoning'), None
     elif contract.layout == 'codex-cli-inclusive':
         inp, out = read('input_tokens'), read('output_tokens')
         cached = read('cached_input_tokens')
@@ -197,20 +206,36 @@ def price_usage(normalized, tariff: UsageTariff | None):
 
 def reported_cost(raw, contract: UsageContract | None):
     """Use only an explicit provider contract, never a generic field named cost."""
-    if not contract or contract.layout not in {'openrouter-inclusive', 'openrouter-responses-inclusive'} or not isinstance(raw, dict):
+    if (not contract or contract.layout not in {'openrouter-inclusive', 'openrouter-responses-inclusive', 'opencode-exclusive'}
+            or not isinstance(raw, dict)):
         return None
-    value = raw.get('cost')
+    amount = _amount(raw.get('cost'))
+    if amount is None:
+        return None
+    if contract.layout == 'opencode-exclusive':
+        gateway = raw.get('opencode') if isinstance(raw.get('opencode'), dict) else {}
+        source = gateway.get('billing_source')
+        known = {'list_cost': _amount(gateway.get('list_cost')), 'allowance': _amount(gateway.get('allowance'))}
+        return {'currency': 'USD', 'known_amount': str(amount), 'complete': True,
+                'unpriced_categories': [], 'tariff': None, 'basis': 'provider_reported',
+                'source': 'opencode.usage.cost',
+                'scope': 'OpenCode balance charge: 0 for Go use within its limits; list_cost and allowance inform only.',
+                'opencode': {'billing_source': source if source in {'free', 'balance', 'go', 'go-plus', 'byok'} else None,
+                             **{k: None if v is None else str(v) for k, v in known.items()}}}
+    return {'currency': 'USD', 'known_amount': str(amount), 'complete': True,
+            'unpriced_categories': [], 'tariff': None, 'basis': 'provider_reported',
+            'source': 'openrouter.usage.cost', 'scope': 'OpenRouter account charge; external BYOK billing is separate.'}
+
+
+def _amount(value):
+    """A finite non-negative decimal from a provider's JSON number or string, else None."""
     if type(value) not in (int, float, str):
         return None
     try:
         amount = Decimal(str(value))
     except InvalidOperation:
         return None
-    if not amount.is_finite() or amount < 0:
-        return None
-    return {'currency': 'USD', 'known_amount': str(amount), 'complete': True,
-            'unpriced_categories': [], 'tariff': None, 'basis': 'provider_reported',
-            'source': 'openrouter.usage.cost', 'scope': 'OpenRouter account charge; external BYOK billing is separate.'}
+    return amount if amount.is_finite() and amount >= 0 else None
 
 
 def cli_cost_estimate(raw, contract: UsageContract | None):
@@ -334,6 +359,7 @@ def native_usage_report(journal, observations, *, contracts, tariffs=None,
         if contract and protocol not in {"chat-inclusive": {"openai-chat"}, "gemini-chat": {"openai-chat"}, "openrouter-inclusive": {"openai-chat"}, "openrouter-responses-inclusive": {"openai-responses"}, "responses-inclusive": {"openai-codex-responses", "openai-responses"},
                                      "converse-exclusive": {"bedrock-converse"},
                                      "anthropic-exclusive": {"anthropic-messages"},
+                                     "opencode-exclusive": {"openai-chat", "openai-responses", "anthropic-messages"},
                                      "claude-cli-exclusive": {"vendor-cli"}, "codex-cli-inclusive": {"vendor-cli"},
                                      "agy-cli-exclusive": {"vendor-cli"}}[contract.layout]:
             raise ValueError("usage contract protocol mismatch")

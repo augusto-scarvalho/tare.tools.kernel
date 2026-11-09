@@ -874,6 +874,24 @@ discount on output or on a whole call. Provider costs remain raw unless an
 explicit tariff is supplied. See the [provider policy](https://openrouter.ai/docs/guides/best-practices/prompt-caching).
 
 
+## Declared session header and OpenCode usage
+
+A profile may declare `session_header`, a provider's per-conversation header. The only one admitted is
+`x-opencode-session`, and only on `openai-chat`, `openai-responses` and `anthropic-messages` profiles. The adapter
+sends the same opaque key it uses for OpenRouter's `session_id` and the Responses `prompt_cache_key`, derived from
+the native session ID, as that header on every generation exchange, streamed or not. OpenCode uses it for routing
+and prompt caching. The HTTP client admits per-exchange headers from that list only, never a credential, and
+rejects any other name or a control character before dispatch. A port without `post_observed` (a test fixture)
+receives no header. A profile without the field keeps its earlier digest.
+
+The `opencode-exclusive` usage contract applies to those three protocols. It reads OpenCode's disjoint counters
+under `usage.opencode.tokens`: `input` excludes cache reads and writes, `output` includes `reasoning`, and cache
+writes are `cache_write_5m + cache_write_1h`. The family's own `prompt_tokens`/`input_tokens` stay raw evidence. A
+missing block leaves every counter unknown. The reported charge is `usage.cost`, which is 0 for Go use within the
+plan's limits. It carries `opencode.billing_source` (`free`, `balance`, `go`, `go-plus` or `byok`; anything else
+becomes null), `list_cost` and `allowance`, the dollars of the Go plan's monthly limit the request used. See
+[OpenCode inference](https://opencode.ai/docs/console/api/inference) and [OpenCode Go](https://opencode.ai/docs/go).
+
 ## Streaming reasoning custody (0.9.73)
 
 Chat streaming consolidates consecutive indexed `reasoning.text` and
