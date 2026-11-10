@@ -190,6 +190,20 @@ def test_read_start_defaults_to_a_bounded_page_at_that_line(setup):
     assert page.status == 'succeeded' and json.loads(page.output_json)['truncated']
 
 
+@pytest.mark.parametrize('content,final', [(b'value = 1\n', True), (b'value = 1', False), (b'value = 1\r\n', True)])
+def test_a_page_reaching_the_end_says_whether_the_file_ends_with_a_line_break(setup, content, final):
+    # The numbered lines cannot show it; Claude Haiku 5.5 "added" a newline the file had (2026-11-09).
+    root, _, tools, control = setup
+    (root/'a.py').write_bytes(content)
+    data = json.loads(call(tools, control, 'read', repository='repo', path='a.py').output_json)
+    assert data['text'] == '1|value = 1' and data['final_newline'] is final
+    (root/'a.py').write_bytes(b''.join(b'value = %d\n' % i for i in range(1, 301)))
+    first = json.loads(call(tools, control, 'read', repository='repo', path='a.py').output_json)
+    assert 'final_newline' not in first and first['next_start'] == 201  # a page short of the end says nothing
+    last = json.loads(call(tools, control, 'read', repository='repo', path='a.py', start=201).output_json)
+    assert last['final_newline'] is True
+
+
 @pytest.mark.parametrize('replacement', ['new rules', 'old rules'])
 def test_instruction_edit_reports_boundary_without_replacing_pins(setup, replacement):
     root, scratch, _, control = setup

@@ -219,7 +219,12 @@ Source reads keep their 24,000-byte text page limit. A longer single line return
 `next_start`/`next_start_column`. Pass the latter as `start`/`start_column` to read
 the next fragment; ordinary line pagination is unchanged. The complete file hash
 still binds its observed version, not a claim of full content inspection. JSON
-pointer and source-line coordinates cannot be mixed.
+pointer and source-line coordinates cannot be mixed. Numbered lines drop the file's
+last line break, so a page that reaches the end of the file also returns
+`final_newline`, whether the file ends with one; the tool description asks the model
+to keep it unless the task changes it. Without it, Claude Haiku 5.5 took
+`value = 1` for a file with no final newline and replaced it with `value = 2\n`,
+doubling the line break.
 An explicitly named source can be up to 8 MiB, including through an approved
 external-folder reader. An explicit-file search shares that input bound; broad
 directory scans retain their 2 MiB per-file policy. If an explicit source is
