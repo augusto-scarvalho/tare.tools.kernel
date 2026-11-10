@@ -89,7 +89,9 @@ def test_host_can_remove_only_verification_cap_while_parent_and_command_limits_r
     if not unbounded:
         assert seen[0]['timeout'] == 300
     elif math.isfinite(parent_seconds):
-        assert 990 < seen[0]['timeout'] <= 1000  # enclosing deadline still wins
+        # The enclosing deadline still wins. The bound allows float rounding: with a clock that has not ticked,
+        # (now + 1000) - now came out as 1000.0000000000001 on a Windows runner.
+        assert 990 < seen[0]['timeout'] < 1000.001
     else:
         assert math.isinf(seen[0]['timeout'])
     tools._tools.command(['ordinary-command'], root, gate=False, read_only=True)
