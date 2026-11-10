@@ -116,6 +116,24 @@ another provider, or create a second runtime. NativeSession still owns tools.
   the adapter never toggles thinking or changes other parameters to force delivery.
   OpenAI Chat still forces its nested named function choice; OpenAI Responses and
   Codex Responses still force `{'type': 'function', 'name': 'tare_deliver'}`.
+- `gemini-generate-content`: Gemini's own API, POST `/models/<model>:generateContent` under the profile endpoint
+  (OpenCode: `https://opencode.ai/inference/go/google/v1beta`), with the common Bearer credential. JSON only:
+  `streaming=True` is rejected before dispatch. The system prompt is `systemInstruction`, the output limit is
+  `generationConfig.maxOutputTokens`, and the profile parameters `temperature`, `topP`, `topK`, `stopSequences`
+  and `thinkingConfig` go into `generationConfig`; any other parameter is refused. Tools are
+  `functionDeclarations` with `parametersJsonSchema`; the choice is `AUTO`, or `ANY` restricted to `tare_deliver`
+  on a forced last call. The model's original parts, with their opaque `thoughtSignature`, are replayed unchanged.
+  A tool result is a `functionResponse` (`output`, or `error` for a failed effect) carrying the call's id when
+  the API gave one; a call without an id is identified by its position in the reply. The results of one batch
+  share a user turn that holds nothing else: OpenCode refused a turn mixing a result with text (HTTP 400,
+  "Requests ending with a model turn are not supported", gemini-4-argon, 2026-11-10), so text after a result
+  starts its own turn. Thought summaries are not answer text. Code execution, hosted search and any other part
+  kind refuse the whole reply. `finishReason` other than `STOP` is an incomplete reply without effects
+  (`MAX_TOKENS` with calls asks for smaller steps). `modelVersion` is the observed model and `usageMetadata` the
+  raw usage; the context anchor is `promptTokenCount`, which includes cached content. Only the
+  `opencode-exclusive` usage contract is admitted for it so far; Google's own endpoint, its `x-goog-api-key`
+  header and its native usage layout are not qualified. Gemini's implicit cache was read only some 30 to 60
+  seconds after a prefix was first sent (same probe), so short sessions read little of it.
 
 Anthropic usage uses the distinct `anthropic-exclusive` contract: `input_tokens`,
 `cache_read_input_tokens`, and `cache_creation_input_tokens` are disjoint input
@@ -882,15 +900,16 @@ explicit tariff is supplied. See the [provider policy](https://openrouter.ai/doc
 ## Declared session header and OpenCode usage
 
 A profile may declare `session_header`, a provider's per-conversation header. The only one admitted is
-`x-opencode-session`, and only on `openai-chat`, `openai-responses` and `anthropic-messages` profiles. The adapter
+`x-opencode-session`, and only on `openai-chat`, `openai-responses`, `anthropic-messages` and
+`gemini-generate-content` profiles. The adapter
 sends the opaque key behind OpenRouter's `session_id` (the Responses `prompt_cache_key` is its first 64
 characters), derived from the native session ID, as that header on every generation exchange, streamed or not. OpenCode uses it for routing
 and prompt caching. The HTTP client admits per-exchange headers from that list only, never a credential, and
 rejects any other name or a control character before reading any credential or request header. A port without `post_observed` (a test fixture)
 receives no header. A profile without the field keeps its earlier digest.
 
-The `opencode-exclusive` usage contract applies to those three protocols. It reads OpenCode's disjoint counters
-under `usage.opencode.tokens`: `input` excludes cache reads and writes, `output` includes `reasoning`, and cache
+The `opencode-exclusive` usage contract applies to those four protocols. It reads OpenCode's disjoint counters
+under `usage.opencode.tokens` (`usageMetadata.opencode.tokens` on `gemini-generate-content`): `input` excludes cache reads and writes, `output` includes `reasoning`, and cache
 writes are `cache_write_5m + cache_write_1h`. The family's own `prompt_tokens`/`input_tokens` stay raw evidence. A
 missing block leaves every counter unknown. The reported charge is `usage.cost`, which is 0 for Go use within the
 plan's limits. It carries `opencode.billing_source` (`free`, `balance`, `go`, `go-plus` or `byok`; anything else

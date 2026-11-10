@@ -25,7 +25,12 @@ from tare_tools_agent_runtime import (
     ModelReply, ModelRequest, ToolCall,
 )
 
-CHAT_PROTOCOLS = {"openai-chat", "openai-responses", "anthropic-messages", "openai-codex-responses", "vendor-cli"}
+CHAT_PROTOCOLS = {"openai-chat", "openai-responses", "anthropic-messages", "openai-codex-responses", "vendor-cli",
+                  "gemini-generate-content"}
+# Profiles that reach a provider API over HTTP with the common Bearer credential.
+HTTP_API_PROTOCOLS = frozenset({"openai-chat", "openai-responses", "anthropic-messages", "gemini-generate-content"})
+# Profile parameters a generateContent request carries in its generationConfig.
+GEMINI_PARAMETERS = frozenset({"temperature", "topP", "topK", "stopSequences", "thinkingConfig"})
 MAX_WIRE_BYTES = 1024 * 1024
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
 DELIVERY_TOOL = "tare_deliver"
@@ -302,6 +307,8 @@ class ModelProfile:
             if (not isinstance(output, dict) or set(output) != {'effort'} or not isinstance(output.get('effort'), str)
                     or output['effort'] not in {'low', 'medium', 'high', 'xhigh', 'max'}):
                 raise ValueError('unsupported Anthropic output_config.effort')
+        if self.protocol == 'gemini-generate-content' and set(params) - GEMINI_PARAMETERS:
+            raise ValueError('unsupported Gemini parameter')
         if self.template_sha256 is not None and not re.fullmatch(r"[0-9a-f]{64}", self.template_sha256):
             raise ValueError("invalid template digest")
         if type(self.cache_system) is not bool:
@@ -319,12 +326,12 @@ class ModelProfile:
         if self.count_model is None and self.count_model_source is not None:
             raise ValueError('count model source requires count model')
         if self.session_header is not None and (
-                self.protocol not in {'openai-chat', 'openai-responses', 'anthropic-messages'}
+                self.protocol not in HTTP_API_PROTOCOLS
                 or self.session_header not in SESSION_HEADERS):
             raise ValueError('session header must be a known provider session header on an HTTP API profile')
         if self.billing_sources is not None:
             sources = self.billing_sources
-            if (self.protocol not in {'openai-chat', 'openai-responses', 'anthropic-messages'}
+            if (self.protocol not in HTTP_API_PROTOCOLS
                     or not isinstance(sources, (list, tuple)) or not sources
                     or any(not isinstance(s, str) or not re.fullmatch(r'[a-z][a-z-]{0,31}', s) for s in sources)):
                 raise ValueError('billing sources must be lowercase names on an HTTP API profile')
@@ -658,6 +665,8 @@ class NativeModelAdapter:
             raise ValueError('vendor_cli_requires_text_input_and_explicit_estimate')
         if profile.protocol == 'anthropic-messages' and streaming:
             raise ValueError('anthropic_messages_streaming_unsupported')
+        if profile.protocol == 'gemini-generate-content' and streaming:
+            raise ValueError('gemini_generate_content_streaming_unsupported')
         self.streaming, self.on_progress = streaming, on_progress
         specs = object_json(tool_specs_json)
         if response_mode not in {"tools", "text"} or (response_mode == "text" and specs):
@@ -873,7 +882,7 @@ class NativeModelAdapter:
                 output = _project_scoped_instructions(raw, scoped_instructions)
                 if self.profile.protocol in CHAT_PROTOCOLS:
                     message = {"role": "tool", "tool_call_id": pending[0][0], "content": output}
-                    if self.profile.protocol == 'anthropic-messages':
+                    if self.profile.protocol in {'anthropic-messages', 'gemini-generate-content'}:
                         message['_is_error'] = result['status'] != 'succeeded'
                     messages.append(message)
                 else:
@@ -975,6 +984,9 @@ class NativeModelAdapter:
             if self.profile.protocol == 'anthropic-messages':
                 from .native_anthropic import to_messages
                 return to_messages(wire, cache_system=self.profile.cache_system)
+            if self.profile.protocol == 'gemini-generate-content':
+                from .native_gemini import to_generate_content
+                return to_generate_content(wire)
             if self.profile.protocol == 'vendor-cli':
                 from .native_cli import cli_request
                 if self.profile.endpoint == 'cli://claude':
@@ -1025,6 +1037,8 @@ class NativeModelAdapter:
             return '/responses'
         if self.profile.protocol == 'openai-chat':
             return '/chat/completions'
+        if self.profile.protocol == 'gemini-generate-content':
+            return '/models/' + urllib.parse.quote(self.profile.model, safe='') + ':generateContent'
         return self._path('converse-stream' if streaming else 'converse')
 
     def _path(self, operation):
@@ -1086,7 +1100,9 @@ class NativeModelAdapter:
             else:
                 response = self._post(self.client, self._generation_path(streaming=False), transmitted, control, row,
                                       headers)
-            row["usage"] = response.get("usage")  # Raw provider counters, never missing -> zero.
+            native_gemini = self.profile.protocol == 'gemini-generate-content'
+            # Raw provider counters, never missing -> zero.
+            row["usage"] = response.get("usageMetadata" if native_gemini else "usage")
             refused = self._refused_billing(row["usage"])
             if refused:
                 # Charged already: keep the usage, stop before another call is billed the same way.
@@ -1100,7 +1116,8 @@ class NativeModelAdapter:
                 row['fleet_generation'] = response.get('tare_fleet_observation')
                 if not isinstance(row['fleet_generation'], dict) or row['fleet_generation'].get('binding') != self._fleet_binding:
                     raise ModelFailure('FLEET_GENERATION_BINDING_UNCONFIRMED')
-            row["observed_model"] = response.get("model") if self.profile.protocol in CHAT_PROTOCOLS else None
+            row["observed_model"] = (response.get("modelVersion" if native_gemini else "model")
+                                     if self.profile.protocol in CHAT_PROTOCOLS else None)
             row["model_identity"] = ("requested_route_only" if self.profile.protocol == "bedrock-converse"
                                      else "matched" if row["observed_model"] == (
                                          self.profile.expected_response_model or self.profile.model) else "mismatch")
@@ -1182,6 +1199,9 @@ class NativeModelAdapter:
             response = to_chat(response)
         if self.profile.protocol == 'anthropic-messages':
             from .native_anthropic import to_chat
+            response = to_chat(response)
+        if self.profile.protocol == 'gemini-generate-content':
+            from .native_gemini import to_chat
             response = to_chat(response)
         if self.profile.protocol in CHAT_PROTOCOLS:
             choices = response.get("choices")

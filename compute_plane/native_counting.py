@@ -19,6 +19,8 @@ def input_tokens(protocol, endpoint, usage):
         keys = ('inputTokens', 'cacheReadInputTokens', 'cacheWriteInputTokens')
     elif protocol == 'anthropic-messages' or protocol == 'vendor-cli' and endpoint == 'cli://claude':
         keys = ('input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens')
+    elif protocol == 'gemini-generate-content':
+        keys = ('promptTokenCount',)  # includes cached content
     elif protocol == 'vendor-cli' and endpoint == 'cli://agy':
         # Qualified AGY layout is exclusive, as in native_usage: cache reads
         # still occupy context even though they are billed separately.
