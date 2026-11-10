@@ -361,7 +361,8 @@ def native_usage_report(journal, observations, *, contracts, tariffs=None,
         if contract and protocol not in {"chat-inclusive": {"openai-chat"}, "gemini-chat": {"openai-chat"}, "openrouter-inclusive": {"openai-chat"}, "openrouter-responses-inclusive": {"openai-responses"}, "responses-inclusive": {"openai-codex-responses", "openai-responses"},
                                      "converse-exclusive": {"bedrock-converse"},
                                      "anthropic-exclusive": {"anthropic-messages"},
-                                     "opencode-exclusive": {"openai-chat", "openai-responses", "anthropic-messages"},
+                                     "opencode-exclusive": {"openai-chat", "openai-responses", "anthropic-messages",
+                                                            "gemini-generate-content"},
                                      "claude-cli-exclusive": {"vendor-cli"}, "codex-cli-inclusive": {"vendor-cli"},
                                      "agy-cli-exclusive": {"vendor-cli"}}[contract.layout]:
             raise ValueError("usage contract protocol mismatch")

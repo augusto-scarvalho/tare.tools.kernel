@@ -13,6 +13,7 @@ from compute_plane.native_usage import UsageContract, normalize_usage, price_usa
 from compute_plane.native_counting import input_tokens
 from compute_plane.native_stream import decode
 from compute_plane.native_anthropic import to_messages
+from compute_plane.native_gemini import to_chat as gemini_to_chat, to_generate_content
 from tests.test_native_models import Client, SPECS, execution, request, response as chat_response
 from tests.test_native_responses import response as responses_response, Client as StreamClient
 
@@ -27,6 +28,17 @@ def anthropic(name='read', *, stop='tool_use'):
                  'input': {'summary': 'Observed fixtures only.'} if name == 'tare_deliver' else {'path': 'app.py'}}],
             'usage': {'input_tokens': 20, 'output_tokens': 7,
                       'cache_read_input_tokens': 12, 'cache_creation_input_tokens': 4}}
+
+
+def gemini(name='read', *, stop='STOP', call_id='call_1'):
+    call = {'name': name, 'args': {'summary': 'Observed fixtures only.'} if name == 'tare_deliver' else {'path': 'app.py'}}
+    if call_id:
+        call['id'] = call_id
+    return {'modelVersion': 'fixture', 'responseId': 'r1', 'candidates': [{'index': 0, 'finishReason': stop,
+            'content': {'role': 'model', 'parts': [{'text': 'private', 'thought': True},
+                                                   {'functionCall': call, 'thoughtSignature': 'opaque'}]}}],
+            'usageMetadata': {'promptTokenCount': 36, 'cachedContentTokenCount': 12, 'candidatesTokenCount': 7,
+                              'thoughtsTokenCount': 3, 'totalTokenCount': 46}}
 
 
 def model(protocol, client, **kwargs):
@@ -137,11 +149,14 @@ def test_openai_responses_limit_stream_cache_and_existing_decoder(streaming):
     assert client.calls[0] == ('/responses', first)
 
 
-@pytest.mark.parametrize('protocol', ['anthropic-messages', 'openai-responses', 'openai-chat'])
+@pytest.mark.parametrize('protocol', ['anthropic-messages', 'openai-responses', 'openai-chat',
+                                      'gemini-generate-content'])
 def test_multiturn_replays_original_blocks_signatures_and_results(protocol):
     def raw(name):
         if protocol == 'anthropic-messages':
             return anthropic(name)
+        if protocol == 'gemini-generate-content':
+            return gemini(name)
         if protocol == 'openai-responses':
             return responses_response(name)
         value = chat_response('openai-chat', name)
@@ -173,6 +188,24 @@ def test_multiturn_replays_original_blocks_signatures_and_results(protocol):
         results = [b for m in wire['messages'] for b in m['content'] if b['type'] == 'tool_result']
         assert [b['is_error'] for b in results] == [False, True]
         assert all(b['content'] == '{"observed":"offline"}' and b['tool_use_id'] == 'call_1' for b in results)
+    elif protocol == 'gemini-generate-content':
+        assert client.calls[2][0] == '/models/fixture:generateContent'
+        assert wire['systemInstruction'] == {'parts': [{'text': 'Stable system'}]}
+        assert wire['generationConfig'] == {'maxOutputTokens': 1024} and not {'model', 'messages', 'stream'} & set(wire)
+        # Each result has a turn of its own; the budget notice that follows it starts another.
+        assert [(content['role'], [next(iter(set(p) - {'thoughtSignature', 'thought'})) for p in content['parts']])
+                for content in wire['contents']] == [
+            ('user', ['text', 'text']), ('model', ['text', 'functionCall']), ('user', ['functionResponse']),
+            ('user', ['text']), ('model', ['text', 'functionCall']), ('user', ['functionResponse']), ('user', ['text'])]
+        assert wire['contents'][1] == raw('read')['candidates'][0]['content']
+        answers = [p['functionResponse'] for c in wire['contents'] for p in c['parts'] if 'functionResponse' in p]
+        assert answers == [
+            {'id': 'call_1', 'name': 'read', 'response': {'output': '{"observed":"offline"}'}},
+            {'id': 'call_1', 'name': 'edit', 'response': {'error': '{"observed":"offline"}'}}]
+        assert wire['toolConfig'] == {'functionCallingConfig': {'mode': 'AUTO'}}
+        declared = wire['tools'][0]['functionDeclarations']
+        assert [d['name'] for d in declared] == ['edit', 'read', 'verify', 'tare_deliver']
+        assert declared[0]['parametersJsonSchema']['required'] == ['path']
     elif protocol == 'openai-responses':
         assert wire['input'][2:4] == raw('read')['output']
         assert wire['input'][4]['type'] == 'function_call_output'
@@ -365,7 +398,8 @@ def test_session_header_reaches_a_plain_port_without_breaking_it():
     assert adapter.generate(request(), execution()).proposes_delivery
 
 
-@pytest.mark.parametrize('protocol', ['openai-chat', 'openai-responses', 'anthropic-messages'])
+@pytest.mark.parametrize('protocol', ['openai-chat', 'openai-responses', 'anthropic-messages',
+                                      'gemini-generate-content'])
 def test_loopback_session_header_on_every_opencode_family(protocol):
     seen = []
     class Handler(BaseHTTPRequestHandler):
@@ -374,6 +408,7 @@ def test_loopback_session_header_on_every_opencode_family(protocol):
             seen.append((self.path, {k.lower(): v for k, v in self.headers.items()}))
             data = json.dumps(anthropic('tare_deliver') if protocol == 'anthropic-messages'
                               else responses_response('tare_deliver') if protocol == 'openai-responses'
+                              else gemini('tare_deliver') if protocol == 'gemini-generate-content'
                               else chat_reply()).encode()
             self.send_response(200)
             self.send_header('Content-Length', str(len(data)))
@@ -388,7 +423,9 @@ def test_loopback_session_header_on_every_opencode_family(protocol):
         adapter = model(protocol, client, profile_args={'session_header': 'x-opencode-session'})
         adapter.generate(request(), execution()); adapter.generate(request(), execution())
         assert [path for path, _ in seen] == ['/v1/' + {'openai-chat': 'chat/completions', 'openai-responses': 'responses',
-                                                         'anthropic-messages': 'messages'}[protocol]] * 2
+                                                         'anthropic-messages': 'messages',
+                                                         'gemini-generate-content': 'models/fixture:generateContent',
+                                                         }[protocol]] * 2
         keys = {received['x-opencode-session'] for _, received in seen}
         assert len(keys) == 1 and keys.pop().startswith('tare-')
         assert all(received['authorization'] == 'Bearer fixture-key' for _, received in seen)
@@ -440,3 +477,86 @@ def test_a_429_resetting_after_the_call_is_not_retried_now():
     long = http_failure({'status': 429, 'retry_after': 14921}, {}, execution())
     short = http_failure({'status': 429, 'retry_after': 5}, {}, execution())
     assert not long.retryable and short.retryable and long.code == short.code == 'HTTP_429'
+
+
+GEMINI = 'gemini-generate-content'
+
+
+@pytest.mark.parametrize('mutation', ['wrong_model', 'hosted', 'malformed', 'missing_stop', 'duplicate', 'candidates'])
+def test_gemini_invalid_response_rejects_whole_batch(mutation):
+    value = gemini()
+    candidate = value['candidates'][0]
+    parts = candidate['content']['parts']
+    if mutation == 'wrong_model': value['modelVersion'] = 'other'
+    if mutation == 'hosted': parts.append({'executableCode': {'language': 'PYTHON', 'code': 'print(1)'}})
+    if mutation == 'malformed': parts[-1]['functionCall']['args'] = 'not an object'
+    if mutation == 'missing_stop': candidate.pop('finishReason')
+    if mutation == 'duplicate': parts.append(copy.deepcopy(parts[-1]))
+    if mutation == 'candidates': value['candidates'].append(copy.deepcopy(candidate))
+    rows = []
+    adapter = model(GEMINI, Client([value]), observe=rows.append)
+    with pytest.raises(ModelFailure, match='INVALID_PROVIDER_RESPONSE'):
+        adapter.generate(request(), execution())
+    assert rows[-1]['status'] == 'invalid_response' and rows[-1]['usage'] == value['usageMetadata']
+
+
+def test_gemini_incomplete_replies_have_no_effects_and_streaming_is_refused():
+    reply = model(GEMINI, Client([gemini(stop='MAX_TOKENS')])).generate(request(), execution())
+    assert not reply.tool_calls and not reply.proposes_delivery
+    assert json.loads(reply.metadata_json)['recovery']['code'] == 'TRUNCATED_TOOL_CALL'
+    empty = gemini(stop='MAX_TOKENS')
+    empty['candidates'][0].pop('content')  # the output limit fell inside the model's thinking
+    blocked = gemini(stop='SAFETY')
+    for value, reason in ((empty, 'length'), (blocked, 'gemini:SAFETY')):
+        rows = []
+        reply = model(GEMINI, Client([value]), observe=rows.append).generate(request(), execution())
+        assert not reply.tool_calls and not reply.proposes_delivery and not reply.complete
+        assert json.loads(reply.metadata_json)['provider_stop_reason'] == reason and rows[-1]['status'] == 'partial'
+    with pytest.raises(ValueError, match='streaming'):
+        model(GEMINI, StreamClient([]), streaming=True)
+
+
+def test_gemini_wire_forces_delivery_carries_parameters_and_refuses_others():
+    adapter = model(GEMINI, Client([]), force_final_delivery=True, profile_args={
+        'parameters_json': json.dumps({'thinkingConfig': {'thinkingLevel': 'high'}, 'temperature': 0.2})})
+    wire = adapter.wire(replace(request(), remaining_model_calls=1))
+    assert wire['toolConfig'] == {'functionCallingConfig': {'mode': 'ANY', 'allowedFunctionNames': ['tare_deliver']}}
+    assert wire['generationConfig'] == {'maxOutputTokens': 1024, 'temperature': 0.2,
+                                        'thinkingConfig': {'thinkingLevel': 'high'}}
+    assert adapter.wire(request())['toolConfig'] == {'functionCallingConfig': {'mode': 'AUTO'}}
+    with pytest.raises(ValueError, match='Gemini'):
+        ModelProfile(GEMINI, 'fixture', 32768, 1024, 'fixture', 'http://fixture',
+                     parameters_json='{"reasoning_effort":"high"}')
+
+
+def test_gemini_calls_without_ids_images_and_empty_turns():
+    assistant = gemini_to_chat(gemini(call_id=None))['choices'][0]['message']
+    assert assistant['tool_calls'][0]['id'] == 'call_0' and assistant['content'] == ''
+    history = [{'role': 'system', 'content': 's'},
+               {'role': 'user', 'content': [{'type': 'text', 'text': 'look'},
+                                            {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,YWJj'}}]},
+               assistant, {'role': 'tool', 'tool_call_id': 'call_0', 'content': '{}'},
+               {'role': 'assistant', 'content': '', '_gemini_parts': []},
+               {'role': 'user', 'content': 'continue'}]
+    wire = to_generate_content({'model': 'fixture', 'max_tokens': 12, 'stream': False, 'messages': history})
+    assert wire['contents'][0]['parts'] == [{'text': 'look'}, {'inlineData': {'mimeType': 'image/png', 'data': 'YWJj'}}]
+    # A result never shares its turn with text; two results of one batch do.
+    assert wire['contents'][2:] == [
+        {'role': 'user', 'parts': [{'functionResponse': {'name': 'read', 'response': {'output': '{}'}}}]},
+        {'role': 'user', 'parts': [{'text': 'continue'}]}]
+    batch = gemini_to_chat(gemini(call_id=None))
+    batch['choices'][0]['message']['_gemini_parts'].append({'functionCall': {'name': 'verify', 'args': {}}})
+    wire = to_generate_content({'model': 'fixture', 'max_tokens': 12, 'stream': False, 'messages': [
+        *history[:2], batch['choices'][0]['message'], {'role': 'tool', 'tool_call_id': 'call_0', 'content': '{}'},
+        {'role': 'tool', 'tool_call_id': 'call_1', 'content': '{}', '_is_error': True}]})
+    assert wire['contents'][2] == {'role': 'user', 'parts': [
+        {'functionResponse': {'name': 'read', 'response': {'output': '{}'}}},
+        {'functionResponse': {'name': 'verify', 'response': {'error': '{}'}}}]}
+    history[3]['tool_call_id'] = 'call_9'
+    with pytest.raises(ValueError, match='gemini_tool_result_without_call'):
+        to_generate_content({'model': 'fixture', 'max_tokens': 12, 'stream': False, 'messages': history})
+
+
+def test_gemini_context_anchor_counts_the_whole_prompt():
+    assert input_tokens(GEMINI, '', gemini()['usageMetadata']) == 36
+    assert input_tokens(GEMINI, '', {'candidatesTokenCount': 7}) is None

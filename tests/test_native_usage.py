@@ -441,6 +441,8 @@ def test_opencode_report_accepts_its_families_and_rejects_others():
     result = native_usage_report(log, rows, contracts={adapter.profile_digest: OPENCODE})
     assert result['known_cost_by_currency'] == {'USD': '0'}
     assert result['calls'][0]['cost']['opencode']['billing_source'] == 'go'
+    rows[0]['protocol'] = 'gemini-generate-content'  # usageMetadata carries the same cost and opencode block
+    assert native_usage_report(log, rows, contracts={adapter.profile_digest: OPENCODE})['known_cost_by_currency'] == {'USD': '0'}
     rows[0]['protocol'] = 'bedrock-converse'
     with pytest.raises(ValueError, match='protocol mismatch'):
         native_usage_report(log, rows, contracts={adapter.profile_digest: OPENCODE})
