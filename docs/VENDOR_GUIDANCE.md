@@ -55,18 +55,23 @@ No official way to see what AGY adds was found, so nothing is listed and any cho
 anything is sent (`CLI_GUIDANCE_UNSUPPORTED`, `not_started`) when the CLI is older than 2.1.322, the release
 measured, or when its `--help` lacks `--plugin-dir` (`CLI_CAPABILITY_UNAVAILABLE`, `missing_cli_switches`).
 
-A mod's hooks do not run while settings carry `disableAllHooks: true`. Claude decisions use the native codec, which
-already runs with hooks on (tare's own PreToolUse hook), so the mod applies there. Summaries and the rollback
-toolless and StructuredOutput codecs keep `disableAllHooks: true`: there the mod would be silently ignored, so a call
-with a Claude choice is refused (`CLI_GUIDANCE_UNSUPPORTED`, `refused: hooks_disabled_codec`). Turning hooks on there
-was measured to work (the chosen blocks were absent and the request otherwise identical), but it would also run the
-hooks of the plugins Claude Code builds in, which `--setting-sources ''` and `enabledPlugins: {}` do not exclude: on
-2.1.322 the init row lists `cc-plugin-agents-md`, `cc-plugin-telemetry`, `cc-plugin-privacy` and
-`cc-plugin-plugin-authoring` in every codec. That is the owner's decision, not made here.
+A mod's hooks do not run while settings carry `disableAllHooks: true`. The native codec with tools (Claude decisions)
+already runs with hooks on, for tare's own PreToolUse hook. Calls without tools take the same native codec with an
+empty catalog (heads-up notes, plain answers); they, summaries and the rollback toolless and StructuredOutput codecs
+set `disableAllHooks: true`. When a Claude choice is saved, tare drops that key from those calls (keeping
+`enabledPlugins: {}`), so the mod runs in every shape. A call without a choice is unchanged.
 
-The receipt's `vendor_guidance` holds each chosen item's control (`choices`), the SHA-256 of the exact choices, and
-`mod_listed_at_init`: whether the stream's init row listed `tare-guidance` among its `plugins` (name, path, source,
-version). The init row says nothing about the plugin's hooks.
+The trade: hooks on also run the hooks of the plugins Claude Code builds in, which neither `--setting-sources ''` nor
+`enabledPlugins: {}` excludes. On 2.1.322 the init row lists `cc-plugin-agents-md`, `cc-plugin-telemetry`,
+`cc-plugin-privacy` and `cc-plugin-plugin-authoring` in every codec. The native codec with tools already runs their
+hooks on every call; the other shapes run them only while the owner has a Claude choice saved. Measured on 2.1.322,
+the guided request in each shape equals the unguided one except the chosen blocks, the temp folder name, the billing
+header hash and the session id Claude Code generates per run.
+
+The receipt's `vendor_guidance` holds each chosen item's control (`choices`), the SHA-256 of the exact choices,
+`hooks_turned_on` (whether tare turned hooks on for this call) and `mod_listed_at_init`: whether the stream's init
+row listed `tare-guidance` among its `plugins` (name, path, source, version). The init row says nothing about the
+plugin's hooks.
 
 **Codex.** Codex can leave a block out but not rewrite it. `prepare` adds `-c` switches
 (`skills.include_instructions=false`, `include_permissions_instructions=false`,
@@ -80,7 +85,7 @@ not with it; otherwise the call is refused (`CLI_GUIDANCE_UNSUPPORTED`, `unprove
 
 `tools/vendor_guidance_capture.py` reproduces both measurements, spending no tokens and writing nothing to disk:
 
-    python tools/vendor_guidance_capture.py claude <path to claude.exe> native|summary|toolless|structured ['{"user_email": null}']
+    python tools/vendor_guidance_capture.py claude <path to claude.exe> native|plain|summary|toolless|structured ['{"user_email": null}']
     python tools/vendor_guidance_capture.py codex <path to codex.exe> ['{"environment_context": null}']
 
 For Claude it runs tare's own `VendorCliClient` (same flags, input and mod) against a loopback recorder that answers
@@ -91,17 +96,23 @@ request with the email replaced. When a block changed or a new one appears, upda
 `measured_version` in `vendor_guidance.py` and the tables above; when a release changes how hooks or switches work,
 update `CLAUDE_GUIDANCE_MINIMUM` or the Codex keys.
 
-Results on 2026-11-12: Claude native codec with `user_email`, `environment`, `model` removed and `date` replaced:
-the three blocks absent, the replacement present, `tare-guidance` listed at init. Summary, toolless and
-StructuredOutput codecs with a choice: refused before dispatch. Codex with all four removed: `unproved: []` and
-`prompt-input` shows only tare's request.
+`plain` is a call without tools. `claude()` returns the recorded body, so a maintainer can compare an unguided and a
+guided request in memory.
+
+Results on 2026-11-12, Claude Code 2.1.322: in the native, plain, summary, toolless and StructuredOutput shapes, with
+`user_email`, `environment` and `model` removed and `date` replaced, the three blocks were absent, the trailing
+system message was only the replacement, `tare-guidance` was listed at init, and the request otherwise equalled the
+unguided one (apart from the temp folder name, billing hash and per-run session id). Codex 0.166.0 with all four
+removed: `unproved: []` and `prompt-input` shows only tare's request.
 
 ## Limits
 
 - Claude mods fail open: a hook that fails passes the vendor's text through, so a removal on Claude is not proved
   per request. `mod_listed_at_init` shows only that the plugin loaded.
 - The identity line, the billing header and the tool descriptions are not controlled.
-- While a Claude choice is saved, Claude summaries are refused (see above).
+- While a Claude choice is saved, calls tare normally runs with hooks off (summaries, calls without tools) also run
+  the hooks of Claude Code's built-in plugins (see above). What those hooks do was checked only by comparing the
+  recorded requests.
 - AGY is not inspectable.
 - What a provider adds on its own servers is invisible to all of this.
 - The texts were measured on Windows; other platforms differ in the environment blocks.

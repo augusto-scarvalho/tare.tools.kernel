@@ -157,8 +157,9 @@ _CATALOG = {
     'cli://claude': {
         'cli': 'Claude Code', 'measured_version': '2.1.322',
         'note': 'Measured on Windows under tare\'s own flags. Removing and replacing work through a small mod tare '
-                'loads for the call, in Claude decisions only: summaries run with hooks off, so while a Claude choice '
-                'is saved a Claude summary is refused. If the mod fails, Claude Code sends its own text anyway.',
+                'loads for the call, which needs Claude Code\'s hooks on: while a Claude choice is saved, calls that '
+                'tare normally runs with hooks off (summaries, calls without tools) also run the hooks of the plugins '
+                'built into Claude Code. If the mod fails, Claude Code sends its own text anyway.',
         'items': [
             {'id': 'billing_header', 'title': 'Billing header line', 'sent_as': 'first system block', 'controls': (),
              'text': 'x-anthropic-billing-header: cc_version=<CLI version>.<short hash>; cc_entrypoint=sdk-cli;'},

@@ -21,8 +21,10 @@ CHAT = {'model': 'fixture', 'effort': 'high',
             'type': 'object', 'properties': {'path': {'type': 'string'}}, 'required': ['path'],
             'additionalProperties': False}}}],
         'messages': [{'role': 'system', 'content': 'Role guidance.'}, {'role': 'user', 'content': 'Read a.py.'}]}
+# claude-plain is how a Claude call without tools goes (generate_text: heads-up notes, plain answers): the native codec
+# with an empty catalog, so Claude Code runs with hooks off, like summaries and the rollback codecs.
 CODECS = {'claude-native': ('cli://claude', {'native': True}), 'claude-summary': ('cli://claude', {'summary': True}),
-          'claude-toolless': ('cli://claude', {}),
+          'claude-plain': ('cli://claude', {'native': True}), 'claude-toolless': ('cli://claude', {}),
           'claude-structured': ('cli://claude', {'structured': True, 'formatter': True}),
           'agy': ('cli://agy', {'structured': True}),
           'codex': ('cli://codex', {'structured': True, 'native_arguments': True})}
@@ -63,7 +65,8 @@ def dispatched(tmp_path, monkeypatch, codec, *, version=None, switches=None, pro
                                      qualification=AnyQualified(), **client)
     for _ in range(repeat):
         with pytest.raises(expect) as caught:
-            cli.post_observed('', native_cli.cli_request(json.loads(json.dumps(CHAT)), **flags), execution())
+            chat = json.loads(json.dumps({**CHAT, 'tools': []} if codec == 'claude-plain' else CHAT))
+            cli.post_observed('', native_cli.cli_request(chat, **flags), execution())
     return {**seen, 'receipt': caught.value.transport_observation, 'error': caught.value}
 
 
@@ -74,8 +77,9 @@ def fingerprint(seen):
             return {k: normal(v) for k, v in value.items()}
         if isinstance(value, list):
             return [normal(v) for v in value]
-        for path, name in ((seen['root'], '<root>'), (seen['root'].parent, '<tmp>'),
-                           (Path(sys.executable), '<python>'), (Path(native_cli.__file__).parent, '<kernel>')):
+        places = ((seen['root'], '<root>'), (seen['root'].parent, '<tmp>'), (Path(sys.executable), '<python>'),
+                  (Path(native_cli.__file__).parent, '<kernel>'))
+        for path, name in sorted(places, key=lambda p: -len(str(p[0]))):  # a checkout may sit in the temp folder
             for form in (json.dumps(str(path))[1:-1], str(path), path.as_posix()):
                 value = value.replace(form, name)
         return re.sub(r'[\\/]+', '/', value)
@@ -87,6 +91,7 @@ def fingerprint(seen):
 # keep receiving exactly these bytes.
 BEFORE = {'agy': '3dae06ce2c95d5ac02456be7a0c4abefa84e47d1449b5db86cef907e76922d96',
           'claude-native': '856e71e6797bdf96c8f470fb3946e66316c7024707637a860f9bc8c1003b0694',
+          'claude-plain': '3ff2f1e8baa5e93f595d887e7d9085d545a9624c9219465f450143599da35e5d',
           'claude-structured': '9acec21e03908e2c9d814362b06a713fd3e7ebff206ecfb03e26a5a1c2876a72',
           'claude-summary': '53a9f9aa1de77632d6254fe197b02cc5cde28ad70276408ab50198b81192c8b6',
           'claude-toolless': '12ae6937dcbd2944854853e78f64c82e21699d5afac8cf935c506b2932680c4c',
@@ -142,11 +147,13 @@ def test_agy_offers_nothing_to_choose(tmp_path):
                                    vendor_guidance={'environment': None})
 
 
-def test_claude_decisions_carry_the_choices_as_a_mod_and_nothing_else_changes(tmp_path, monkeypatch):
+@pytest.mark.parametrize('codec', ['claude-native', 'claude-plain', 'claude-summary', 'claude-toolless',
+                                   'claude-structured'])
+def test_claude_choices_travel_as_a_mod_with_hooks_on_and_nothing_else_changes(tmp_path, monkeypatch, codec):
     choices = {'user_email': None, 'environment': None, 'date': 'Today is a working day.'}
-    seen = dispatched(tmp_path, monkeypatch, 'claude-native', version=CLAUDE_MEASURED, switches=WITH_MOD,
+    seen = dispatched(tmp_path, monkeypatch, codec, version=CLAUDE_MEASURED, switches=WITH_MOD,
                       vendor_guidance=choices)
-    argv, files = seen['argv'], seen['files']
+    argv, files = list(seen['argv']), seen['files']
     at = argv.index('--plugin-dir')
     assert Path(argv[at + 1]) == seen['root']/'tare-guidance'
     source = files.pop('tare-guidance/hooks/register.ts')
@@ -155,9 +162,16 @@ def test_claude_decisions_carry_the_choices_as_a_mod_and_nothing_else_changes(tm
             '{"date": "Today is a working day.", "environment": null};') in source
     assert json.loads(files.pop('tare-guidance/hooks/hooks.json')) == {'modules': ['./register.ts']}
     assert json.loads(files.pop('tare-guidance/.claude-plugin/plugin.json'))['name'] == 'tare-guidance'
-    assert fingerprint({**seen, 'argv': argv[:at] + argv[at + 2:]}) == BEFORE['claude-native']  # only the mod
+    settings = json.loads(argv[argv.index('--settings') + 1])
+    assert 'disableAllHooks' not in settings and settings['enabledPlugins'] == {}  # the mod's hooks can run
+    turned_on = codec != 'claude-native'  # the native codec with tools already runs with hooks on
     assert seen['receipt']['vendor_guidance'] == {
-        'choices': {'date': 'replace', 'environment': 'remove', 'user_email': 'remove'}, 'sha256': sha(choices)}
+        'choices': {'date': 'replace', 'environment': 'remove', 'user_email': 'remove'}, 'sha256': sha(choices),
+        'hooks_turned_on': turned_on}
+    # Only the mod and, where tare keeps hooks off, that switch differ from a call without a choice.
+    if turned_on:
+        argv[argv.index('--settings') + 1] = native_cli.encode({**settings, 'disableAllHooks': True})
+    assert fingerprint({**seen, 'argv': argv[:at] + argv[at + 2:]}) == BEFORE[codec]
 
 
 def test_the_receipt_says_whether_claude_listed_the_mod_at_init(tmp_path, monkeypatch):
@@ -178,15 +192,6 @@ def test_the_receipt_says_whether_claude_listed_the_mod_at_init(tmp_path, monkey
                                      qualification=AnyQualified(), vendor_guidance={'date': None})
     _, receipt = cli.post_observed('', native_cli.cli_request(json.loads(json.dumps(CHAT)), native=True), execution())
     assert receipt['vendor_guidance']['mod_listed_at_init'] is True
-
-
-@pytest.mark.parametrize('codec', ['claude-summary', 'claude-toolless', 'claude-structured'])
-def test_claude_codecs_that_keep_hooks_off_refuse_a_choice_before_dispatch(tmp_path, monkeypatch, codec):
-    # Their mod would not run with hooks off, so the choice would be silently ignored (capture of 2026-11-12).
-    seen = dispatched(tmp_path, monkeypatch, codec, version=CLAUDE_MEASURED, switches=WITH_MOD,
-                      vendor_guidance={'user_email': None}, expect=ModelFailure)
-    assert seen['error'].code == 'CLI_GUIDANCE_UNSUPPORTED' and seen['error'].not_started and 'argv' not in seen
-    assert seen['receipt']['vendor_guidance']['refused'] == 'hooks_disabled_codec'
 
 
 @pytest.mark.parametrize('version,switches,code', [('2.1.321', WITH_MOD, 'CLI_GUIDANCE_UNSUPPORTED'),

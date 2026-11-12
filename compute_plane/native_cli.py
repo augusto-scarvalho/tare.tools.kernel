@@ -916,12 +916,14 @@ class VendorCliClient:
                         settings = {'enabledPlugins': {}, 'hooks': {'PreToolUse': [{'matcher': '*', 'hooks': [
                             {'type': 'command', 'command': command}]}]}}
                         env['ENABLE_TOOL_SEARCH'] = 'false'
-                    if guided and settings.get('disableAllHooks'):
-                        # The mod's hooks run only with hooks on, and turning them on here would also run the hooks of
-                        # the plugins Claude Code builds in (agents-md, telemetry, privacy, plugin-authoring on 2.1.322),
-                        # which these codecs keep off today. Until the owner accepts that, the choice is refused.
-                        receipt['vendor_guidance']['refused'] = 'hooks_disabled_codec'
-                        raise ModelFailure('CLI_GUIDANCE_UNSUPPORTED', not_started=True)
+                    if guided:
+                        # The mod's hooks run only with hooks on. Turning them on also runs the hooks of the plugins
+                        # Claude Code builds in, which neither --setting-sources '' nor enabledPlugins {} excludes
+                        # (2.1.322: cc-plugin-agents-md, -telemetry, -privacy, -plugin-authoring). The native codec
+                        # with tools already runs them on every call; calls without tools (summaries, plain text)
+                        # take that exposure only while the owner has a Claude choice saved. Measured on 2.1.322:
+                        # with hooks on, the request was otherwise unchanged (tools/vendor_guidance_capture.py).
+                        receipt['vendor_guidance']['hooks_turned_on'] = bool(settings.pop('disableAllHooks', False))
                     argv = [self.executable, '-p', '--model', body['model'], '--effort', body['effort'],
                             '--tools', '', '--strict-mcp-config', '--mcp-config', encode(mcp),
                             '--setting-sources', '', '--settings', encode(settings),

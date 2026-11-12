@@ -1,6 +1,6 @@
 """Re-measure what a vendor CLI adds to tare's requests, spending no tokens (docs/VENDOR_GUIDANCE.md).
 
-  python tools/vendor_guidance_capture.py claude <claude executable> <native|summary|toolless|structured> [choices]
+  python tools/vendor_guidance_capture.py claude <claude executable> <native|plain|summary|toolless|structured> [choices]
   python tools/vendor_guidance_capture.py codex <codex executable> [choices]
 
 `choices` is a JSON object of the owner's choices for that CLI, e.g. '{"user_email": null}'.
@@ -40,7 +40,8 @@ CHAT = {'model': 'claude-sonnet-5-5', 'effort': 'high',
             'additionalProperties': False}}}],
         'messages': [{'role': 'system', 'content': 'TARE-ROLE-GUIDANCE synthetic role text.'},
                      {'role': 'user', 'content': 'TARE-USER-MESSAGE synthetic request.'}]}
-CODECS = {'native': {'native': True}, 'summary': {'summary': True}, 'toolless': {},
+# plain: a Claude call without tools (heads-up notes, plain answers), the native codec with an empty catalog.
+CODECS = {'native': {'native': True}, 'plain': {'native': True}, 'summary': {'summary': True}, 'toolless': {},
           'structured': {'structured': True, 'formatter': True}}
 
 
@@ -107,7 +108,8 @@ def claude(executable, codec, choices):
     client = native_cli.VendorCliClient('cli://claude', executable=executable, version=version,
                                         qualification=Qualified(), vendor_guidance=choices)
     try:
-        client.post_observed('', native_cli.cli_request(json.loads(json.dumps(CHAT)), **CODECS[codec]), control())
+        chat = json.loads(json.dumps({**CHAT, 'tools': []} if codec == 'plain' else CHAT))
+        client.post_observed('', native_cli.cli_request(chat, **CODECS[codec]), control())
     except (ModelFailure, NativeTransportInterrupted) as ended:  # the recorder refused the request
         receipt = getattr(ended, 'transport_observation', None) or {}
         print('Claude Code', version, codec, '| call ended with', getattr(ended, 'code', ended),
@@ -124,6 +126,7 @@ def claude(executable, codec, choices):
                for b in (m['content'] if isinstance(m['content'], list) else [{'text': m['content']}])]
     blocks += [(f'tool {t.get("name")}', t.get('description', '')) for t in body.get('tools', [])]
     report('cli://claude', '\n'.join(text for _, text in blocks), choices, blocks)
+    return body  # for a maintainer's own comparison in memory; nothing is written to disk
 
 
 def codex(executable, choices):
