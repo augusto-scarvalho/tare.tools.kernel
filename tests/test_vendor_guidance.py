@@ -330,3 +330,24 @@ def test_a_codex_removal_its_release_does_not_prove_is_refused_before_dispatch(t
                       prompt_input=rendered_prompt(honoured, renamed), expect=ModelFailure)
     assert seen['error'].code == 'CLI_GUIDANCE_UNSUPPORTED' and seen['error'].not_started and 'argv' not in seen
     assert seen['receipt']['vendor_guidance']['unproved'] == ['collaboration_mode']
+
+
+def test_every_placeholder_of_a_claude_block_has_a_pattern_that_finds_its_value():
+    """An edited block is sent with the values the CLI wrote, so each placeholder `normalized` writes into a Claude
+    attachment needs a FILL pattern that finds that value in the CLI's own text."""
+    import re
+    from compute_plane.vendor_guidance import FILL, normalized
+    own = ('# Environment\n - Primary working directory: C:\Temp\tare-reading-x\n - OS Version: Windows 11 10.0.1\n'
+           'The user\'s email address is someone@example.com.\n'
+           'You are powered by the model named Sonnet 5.5. The exact model ID is claude-sonnet-5-5. '
+           'Assistant knowledge cutoff is June 2026.\n\nToday\'s date is 2026-11-12.')
+    shown = normalized(own, ['C:\Temp\tare-reading-x'])
+    values = {name: re.search(pattern, own)[1] for name, pattern in FILL}
+    assert set(re.findall(r'<[a-zA-Z ]+>', shown)) == set(values)
+    assert values == {'<date>': '2026-11-12', '<OS version>': 'Windows 11 10.0.1',
+                      '<working directory>': 'C:\Temp\tare-reading-x', '<model name>': 'Sonnet 5.5',
+                      '<model id>': 'claude-sonnet-5-5', '<knowledge cutoff>': 'June 2026',
+                      '<account email>': 'someone@example.com'}
+    for name, value in values.items():  # what the mod does, placeholder by placeholder, gives the CLI's text back
+        shown = shown.replace(name, value)
+    assert shown == own

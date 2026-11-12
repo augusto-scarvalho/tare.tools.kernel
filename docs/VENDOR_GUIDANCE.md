@@ -30,6 +30,10 @@ Machine and day values become placeholders: `<working directory>`, `<account ema
 readings of the same CLI therefore give the same texts. Measured on 2026-11-12: two readings of each CLI gave
 identical item hashes.
 
+An edited Claude block is written with those placeholders, and when it is sent the mod puts back the values
+Claude Code wrote in that same block (`FILL`): "Today is `<date>`." goes out with the real date. A placeholder
+whose value is not in that block goes out as written.
+
 ### Item ids and controls
 
 The shape of an id decides what the owner may do with it, so a new block needs no code.

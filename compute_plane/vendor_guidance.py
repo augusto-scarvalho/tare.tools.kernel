@@ -29,6 +29,8 @@ CLAUDE_MOD = '''import type { Register } from 'claude-code';
 const dropContext: string[] = __TARE_DROP__;
 const attachments: Record<string, string | null> = __TARE_ATTACHMENTS__;
 const reading: boolean = __TARE_READING__;
+// Placeholder -> pattern whose first group is that value in the CLI's own text for the same block.
+const fill: [string, string][] = __TARE_FILL__;
 // An empty block stays empty: a mark would make Claude Code send a block it otherwise leaves out.
 const mark = (kind: string, name: string, text: string) =>
   reading && text ? `<<tare ${kind} ${name}>>${text}<</tare ${kind}>>` : text;
@@ -39,11 +41,24 @@ export const register: Register = (on) => {
       .map((b) => ({ ...b, text: mark('context', b.name, b.text) })),
   }));
   on('prompt.attachment', async ($, e, next) => {
-    const text = Object.hasOwn(attachments, e.type) ? attachments[e.type] : (await next(e)).text;
+    const own = Object.hasOwn(attachments, e.type) && attachments[e.type] === null ? null : (await next(e)).text;
+    let text = Object.hasOwn(attachments, e.type) ? attachments[e.type] : own;
+    if (text !== null && text !== own)  // the owner's text: its placeholders take the values the CLI wrote here
+      for (const [name, pattern] of fill) {
+        const found = (own ?? '').match(new RegExp(pattern));
+        if (found) text = text.split(name).join(found[1]);
+      }
     return { text: text === null ? null : mark('attachment', e.type, text) };
   });
 };
 '''
+# The owner edits a block as tare shows it, with placeholders (`normalized`). When the edited text is sent, the mod
+# puts back the values Claude Code wrote in that same block; a placeholder with no value there goes out as written.
+FILL = (('<date>', r'(\d{4}-\d{2}-\d{2})'), ('<OS version>', r'OS Version: (.+)'),
+        ('<working directory>', r'Primary working directory: (.+)'),
+        ('<model name>', r'named (.+?)\. The exact model ID'), ('<model id>', r'The exact model ID is (.+?)\. Assistant'),
+        ('<knowledge cutoff>', r'Assistant knowledge cutoff is (.+?)\.'),
+        ('<account email>', r'([\w.+-]+@[\w-]+(?:\.[\w-]+)+)'))
 # Context blocks render inside an attachment (2.1.322: `session_context`), so each kind has its own end mark.
 MARKS = {kind: re.compile(rf'<<tare {kind} ([^>\s]+)>>(.*?)<</tare {kind}>>', re.S)
          for kind in ('context', 'attachment')}
@@ -116,6 +131,7 @@ def claude_mod(root, choices, *, tag=False):
     (folder/'hooks/hooks.json').write_text(encode({'modules': ['./register.ts']}), encoding='utf-8')
     (folder/'hooks/register.ts').write_text(
         CLAUDE_MOD.replace('__TARE_DROP__', json.dumps(drop)).replace('__TARE_READING__', json.dumps(tag))
+        .replace('__TARE_FILL__', json.dumps(FILL))
         .replace('__TARE_ATTACHMENTS__', json.dumps(attachments, sort_keys=True)), encoding='utf-8')
     return folder
 
