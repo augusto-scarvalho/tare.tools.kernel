@@ -471,6 +471,8 @@ def test_a_real_agy_reading_opens_only_the_conversation_its_call_reported(tmp_pa
                 {'event': 'result', 'result': {'status': 'SUCCESS', 'usage': {'total_tokens': 758}}}]
         return PHYSICAL, '\n'.join(json.dumps(r) for r in rows).encode(), b''
     monkeypatch.setattr(vendor_guidance, 'run_pipe_process', process)
+    local = vendor_guidance.read('cli://agy', str(tmp_path/'agy.exe'))  # no tokens: only its version
+    assert (local['cli_version'], local['items']) == ('1.5.7', []) and not list(store.iterdir())
     value = vendor_guidance.read_real('cli://agy', str(tmp_path/'agy.exe'), model='gemini-3.8-flash-low')
     assert value['cli_version'] == '1.5.7' and value['usage'] == {'total_tokens': 758}
     assert 'tool:manage_task' in {i['id'] for i in value['items']}

@@ -289,8 +289,8 @@ def read(endpoint, executable, *, choices=None, seconds=120):
         return _read_claude(executable, choices or {}, seconds)
     if endpoint == 'cli://codex':
         return _read_codex(executable, choices or {}, seconds)
-    controls(endpoint, '')
-    return {'cli': 'AGY', 'cli_version': None, 'note': NOTES[endpoint], 'items': []}
+    controls(endpoint, '')  # AGY: no zero-token reading, only its version, which says when a real one is due
+    return {'cli': 'AGY', 'cli_version': _version(executable), 'note': NOTES[endpoint], 'items': []}
 
 
 def _read_claude(executable, choices, seconds):
