@@ -669,11 +669,17 @@ def decode_claude_native(rows, hooks, model, tools):
 
 class VendorCliClient:
     def __init__(self, endpoint, *, executable, version, timeout_seconds=120,
-                 request_byte_limit=1024*1024, model_catalog=None, qualification=None, **unused_transport):
+                 request_byte_limit=1024*1024, model_catalog=None, qualification=None, vendor_guidance=None,
+                 **unused_transport):
         if (endpoint not in CLI_MINIMUM or not Path(executable).is_absolute()
                 or Path(executable).suffix.lower() in {'.cmd', '.bat'} or not version):
             raise ValueError('explicit vendor executable and reference version required')
         version_tuple(version)
+        from .vendor_guidance import validate
+        # The owner's choices about the blocks this CLI adds on its own (vendor_guidance.py). None or {} sends
+        # exactly what tare sent before they existed; AGY offers nothing to choose, so any choice is refused here.
+        self.vendor_guidance = validate(endpoint, vendor_guidance)
+        self._codex_guidance = {}  # version -> item ids `codex debug prompt-input` did not prove removed
         if (endpoint == 'cli://codex') != isinstance(model_catalog, dict):
             raise ValueError('Codex requires an explicit model catalog record')
         self.model_catalog = model_catalog
@@ -831,6 +837,14 @@ class VendorCliClient:
                 if version_tuple(actual) < version_tuple(minimum):
                     receipt['minimum_client_version'] = minimum
                     raise ModelFailure('CLI_INCOMPATIBLE_VERSION', not_started=True)
+                guided = bool(self.vendor_guidance)
+                if guided:
+                    from .vendor_guidance import CLAUDE_GUIDANCE_MINIMUM, receipt as guidance_receipt
+                    receipt['vendor_guidance'] = guidance_receipt(self.vendor_guidance)
+                    if (self.endpoint == 'cli://claude'
+                            and version_tuple(actual) < version_tuple(CLAUDE_GUIDANCE_MINIMUM)):
+                        receipt['vendor_guidance']['minimum_client_version'] = CLAUDE_GUIDANCE_MINIMUM
+                        raise ModelFailure('CLI_GUIDANCE_UNSUPPORTED', not_started=True)
                 if (self.endpoint in CLI_SWITCHES
                         and actual not in self._checked_versions):
                     help_args = ['exec', '--help'] if self.endpoint == 'cli://codex' else ['--help']
@@ -838,7 +852,10 @@ class VendorCliClient:
                         timeout=min(10, control.remaining_seconds()), cancelled=control.should_stop,
                         max_output=128*1024)
                     switches = set(re.findall(r'--[a-z][a-z-]*', (help_raw + b'\n' + help_errors).decode('utf-8')))
-                    missing = sorted(CLI_SWITCHES[self.endpoint] - switches)
+                    # The owner's Claude choices travel as a mod: without --plugin-dir they cannot be applied.
+                    required = CLI_SWITCHES[self.endpoint] | (
+                        {'--plugin-dir'} if guided and self.endpoint == 'cli://claude' else set())
+                    missing = sorted(required - switches)
                     if not probe['cleanup_verified']:
                         receipt['cleanup_verified'] = False
                         raise NativeTransportInterrupted('CLI_CLEANUP_UNCONFIRMED', receipt)
@@ -899,6 +916,12 @@ class VendorCliClient:
                         settings = {'enabledPlugins': {}, 'hooks': {'PreToolUse': [{'matcher': '*', 'hooks': [
                             {'type': 'command', 'command': command}]}]}}
                         env['ENABLE_TOOL_SEARCH'] = 'false'
+                    if guided and settings.get('disableAllHooks'):
+                        # The mod's hooks run only with hooks on, and turning them on here would also run the hooks of
+                        # the plugins Claude Code builds in (agents-md, telemetry, privacy, plugin-authoring on 2.1.322),
+                        # which these codecs keep off today. Until the owner accepts that, the choice is refused.
+                        receipt['vendor_guidance']['refused'] = 'hooks_disabled_codec'
+                        raise ModelFailure('CLI_GUIDANCE_UNSUPPORTED', not_started=True)
                     argv = [self.executable, '-p', '--model', body['model'], '--effort', body['effort'],
                             '--tools', '', '--strict-mcp-config', '--mcp-config', encode(mcp),
                             '--setting-sources', '', '--settings', encode(settings),
@@ -907,16 +930,28 @@ class VendorCliClient:
                             '--verbose', '--system-prompt', body['system']]
                     if 'response_schema' in body:
                         argv += ['--json-schema', encode(body['response_schema']), '--max-turns', '2']
+                    if guided:
+                        from .vendor_guidance import claude_mod
+                        argv += ['--plugin-dir', str(claude_mod(root, self.vendor_guidance))]
                     from .native_cli_claude import input_record
                     source = encode(input_record(body)) + '\n'
                 else:
-                    from .native_cli_codex import prepare, user_instructions
+                    from .native_cli_codex import prepare, unproved_removals, user_instructions
                     present = user_instructions(env)
                     if present:  # they would reach every role's call: refused before anything is sent
                         receipt['user_instructions'] = present
                         raise ModelFailure('CLI_USER_INSTRUCTIONS_PRESENT', not_started=True)
+                    if guided:
+                        if actual not in self._codex_guidance:  # once per release, like its feature table
+                            self._codex_guidance[actual] = unproved_removals(
+                                self.executable, root, body, self.model_catalog, self._codex_features[actual],
+                                self.vendor_guidance, control, run_pipe_process, receipt)
+                        if self._codex_guidance[actual]:
+                            receipt['vendor_guidance']['unproved'] = self._codex_guidance[actual]
+                            raise ModelFailure('CLI_GUIDANCE_UNSUPPORTED', not_started=True)
                     argv = [self.executable, *prepare(root, body, self.model_catalog,
-                                                    features=self._codex_features[actual])]
+                                                    features=self._codex_features[actual],
+                                                    guidance=self.vendor_guidance)]
                     source = body['prompt']
                 try:
                     completion = (AgyCompletion(root, body['model'], 'response_schema' in body)
@@ -949,6 +984,11 @@ class VendorCliClient:
                         and t['name'] in known else 'unknown' for t in tools})
                     response = decode_agy(rows, hooks, body['model'], structured='response_schema' in body)
                 elif self.endpoint == 'cli://claude':
+                    if guided:  # 2.1.322's init row lists loaded plugins by name; it says nothing of their hooks
+                        initial = [r for r in rows if r.get('type') == 'system' and r.get('subtype') == 'init']
+                        receipt['vendor_guidance']['mod_listed_at_init'] = (any(
+                            isinstance(p, dict) and p.get('name') == 'tare-guidance'
+                            for p in initial[0].get('plugins') or []) if len(initial) == 1 else None)
                     assistants = [r.get('message', {}) for r in rows if r.get('type') == 'assistant']
                     receipt['assistant_events'] = len(assistants)
                     receipt['assistant_message_ids'] = len({m['id'] for m in assistants
