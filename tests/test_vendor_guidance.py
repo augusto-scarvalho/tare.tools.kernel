@@ -11,7 +11,9 @@ import pytest
 from compute_plane import native_cli
 from compute_plane.native_cli_codex import ENABLED_FEATURES, REQUIRED_FEATURES
 from compute_plane.native_models import NativeTransportInterrupted, sha
-from compute_plane.vendor_guidance import catalog, codex_switches, transport_texts, validate
+from compute_plane import vendor_guidance
+from compute_plane.vendor_guidance import (CODEX_SWITCHES, claude_items, codex_items, codex_switches, normalized,
+                                           transport_texts, validate)
 from tare_tools_agent_runtime import ModelFailure
 from tests.test_native_models import AnyQualified, execution
 
@@ -107,28 +109,113 @@ def test_without_a_choice_every_cli_receives_exactly_what_it_received_before(tmp
 
 CLAUDE_MEASURED = '2.1.322'
 WITH_MOD = native_cli.CLI_SWITCHES['cli://claude'] | {'--plugin-dir'}
-ALL_CODEX = {item['id']: None for item in catalog()['cli://codex']['items']}
+ALL_CODEX = dict.fromkeys(CODEX_SWITCHES)
+READING_BODY = native_cli.cli_request({'model': 'claude-sonnet-5-5', 'tools': [], 'messages': [
+    {'role': 'user', 'content': vendor_guidance.READING_PROMPT}]}, native=True)
 
 
-def test_the_catalog_lists_measured_blocks_and_accepts_only_the_controls_each_offers():
-    entries = catalog()
-    assert set(entries) == {'cli://claude', 'cli://codex', 'cli://agy'}
-    for endpoint, entry in entries.items():
-        for item in entry['items']:
-            assert set(item) == {'id', 'title', 'sent_as', 'controls', 'text'} and item['title'] and item['text']
-            assert set(item['controls']) <= {'remove', 'replace'}
-            if 'remove' in item['controls']:
-                assert validate(endpoint, {item['id']: None}) == {item['id']: None}
-    assert entries['cli://agy']['items'] == [] and entries['cli://agy']['measured_version'] is None
-    assert validate('cli://claude', {'environment': 'A sandbox.'}) == {'environment': 'A sandbox.'}
-    assert validate('cli://codex', None) == {}
-    for endpoint, choices in [('cli://claude', {'identity': None}), ('cli://claude', {'user_email': 'other'}),
-                              ('cli://codex', {'environment_context': 'other'}), ('cli://claude', {'date': ' '}),
-                              ('cli://claude', {'unknown': None}), ('cli://agy', {'anything': None}),
-                              ('cli://other', {})]:
+def test_choices_are_checked_by_the_shape_of_their_id():
+    later = {'context:userEmail': None, 'attachment:environment': 'A sandbox.', 'attachment:added_later': None}
+    assert validate('cli://claude', later) == later  # a block a newer CLI adds is controlled like its kind
+    assert validate('cli://codex', {'environment_context': None}) == {'environment_context': None}
+    assert validate('cli://agy', None) == {}
+    for endpoint, choices in [('cli://claude', {'system:2': None}), ('cli://claude', {'context:userEmail': 'other'}),
+                              ('cli://claude', {'message:1': None}), ('cli://claude', {'attachment:date': ' '}),
+                              ('cli://claude', {'attachment:': None}), ('cli://claude', {'user_email': None}),
+                              ('cli://codex', {'environment_context': 'other'}), ('cli://codex', {'block:5': None}),
+                              ('cli://agy', {'anything': None}), ('cli://other', {})]:
         with pytest.raises(ValueError):
             validate(endpoint, choices)
-    assert '@' not in json.dumps(entries)  # placeholders, never the measuring account's values
+
+
+def recorded_claude(root, email='someone@example.com', day='2026-11-12'):
+    """A request as the reading's recorder keeps it: Claude Code 2.1.322's shape with the reading mod's marks."""
+    from compute_plane.native_cli_claude import input_record
+    context = ('<system-reminder>\n<<tare attachment session_context>>As you answer, use this context:\n'
+               '# userEmail\n<<tare context userEmail>>The user\'s email address is ' + email + '.<</tare context>>'
+               '\n\nAttached by Claude Code.<</tare attachment>>\n</system-reminder>\n')
+    trailing = ('<<tare attachment environment>># Environment\n - Primary working directory: ' + str(root) +
+                '\n - OS Version: Windows ' + day + '<</tare attachment>>\n\n<<tare attachment date>>'
+                'Today\'s date is ' + day + '.<</tare attachment>>')
+    return {'system': [{'text': 'x-anthropic-billing-header: cc_version=2.1.322.b46; cc_entrypoint=sdk-cli;'},
+                       {'text': 'You are a Claude agent.'}, {'text': READING_BODY['system']}],
+            'messages': [{'role': 'user', 'content': [{'type': 'text', 'text': context},
+                                                       *input_record(READING_BODY)['message']['content']]},
+                         {'role': 'system', 'content': [{'type': 'text', 'text': trailing}]}],
+            'tools': [{'name': 'mcp__tare__read', 'description': 'tare\'s own'},
+                      {'name': 'StructuredOutput', 'description': 'Return the result.'}]}
+
+
+def test_a_claude_reading_finds_each_block_by_its_mark_and_two_readings_agree(tmp_path):
+    first = claude_items(recorded_claude(tmp_path/'one'), READING_BODY, [tmp_path/'one'])
+    later = claude_items(recorded_claude(tmp_path/'two', 'other@example.org', '2027-01-30'), READING_BODY,
+                         [tmp_path/'two'])
+    assert first == later  # machine and day values are placeholders
+    items = {item['id']: item for item in first}
+    assert list(items) == ['system:1', 'system:2', 'context:userEmail', 'attachment:session_context', 'message:1',
+                           'attachment:environment', 'attachment:date', 'tool:StructuredOutput']
+    assert items['context:userEmail']['text'] == "The user's email address is <account email>."
+    assert items['context:userEmail']['controls'] == ('remove',)
+    assert '# userEmail\n<context userEmail>' in items['attachment:session_context']['text']
+    assert items['attachment:environment']['controls'] == ('remove', 'replace')
+    assert (' - Primary working directory: <working directory>\n - OS Version: <OS version>'
+            in items['attachment:environment']['text'])
+    assert items['system:1']['text'] == 'x-anthropic-billing-header: cc_version=<CLI version>; cc_entrypoint=sdk-cli;'
+    assert all(items[k]['controls'] == () for k in ('system:1', 'system:2', 'message:1', 'tool:StructuredOutput'))
+    assert items['attachment:environment']['sent_as'] == "system message after tare's records"
+
+
+def test_a_codex_reading_lists_every_block_but_tares_by_its_leading_tag(tmp_path):
+    rendered = json.dumps([
+        {'type': 'message', 'role': 'developer', 'content': [
+            {'type': 'input_text', 'text': '<skills_instructions>\r\n- `r0` = `' + str(tmp_path/'skills') + '`\r\n'},
+            {'type': 'input_text', 'text': '<a_new_block>\nNew text.'}]},
+        {'type': 'message', 'role': 'user', 'content': [
+            {'type': 'input_text', 'text': '<environment_context>\n  <cwd>' + str(tmp_path/'home') + '</cwd>\n'
+                                           '  <current_date>2026-11-12</current_date>\n'
+                                           '  <timezone>America/Sao_Paulo</timezone>\n</environment_context>'},
+            {'type': 'input_text', 'text': vendor_guidance.READING_PROMPT}]}])
+    items = {item['id']: item for item in codex_items(rendered, [tmp_path])}
+    assert list(items) == ['skills_instructions', 'a_new_block', 'environment_context']
+    assert items['skills_instructions']['text'] == '<skills_instructions>\n- `r0` = `<skills folder>`\n'
+    assert items['environment_context']['text'] == (
+        '<environment_context>\n  <cwd><working directory></cwd>\n  <current_date><date></current_date>\n'
+        '  <timezone><time zone></timezone>\n</environment_context>')
+    assert items['skills_instructions']['controls'] == ('remove',) and items['a_new_block']['controls'] == ()
+
+
+def test_reading_claude_runs_tares_command_against_a_local_recorder_and_stops_at_the_first_request(
+        tmp_path, monkeypatch):
+    import urllib.error
+    import urllib.request
+    calls = []
+
+    def process(argv, **options):
+        if argv[-1] == '--version':
+            return PHYSICAL, b'2.1.322 (Claude Code)', b''
+        calls.append(argv)
+        root = options['cwd']
+        assert 'const reading: boolean = true;' in (root/'tare-guidance/hooks/register.ts').read_text(encoding='utf-8')
+        settings = json.loads(argv[argv.index('--settings') + 1])
+        assert 'disableAllHooks' not in settings and settings['enabledPlugins'] == {}
+        request = urllib.request.Request(options['env']['ANTHROPIC_BASE_URL'] + '/v1/messages?beta=true',
+                                         data=json.dumps(recorded_claude(root)).encode(),
+                                         headers={'Authorization': 'Bearer not-kept'}, method='POST')
+        with pytest.raises(urllib.error.HTTPError) as refused:
+            urllib.request.urlopen(request, timeout=10)
+        assert refused.value.code == 400 and options['completed']() is True
+        return PHYSICAL | {'protocol_complete': True}, b'', b''
+    monkeypatch.setattr(vendor_guidance, 'run_pipe_process', process)
+    value = vendor_guidance.read('cli://claude', str(tmp_path/'claude.exe'))
+    assert value['cli_version'] == '2.1.322' and len(calls) == 1
+    assert 'not-kept' not in json.dumps(value) and 'context:userEmail' in {i['id'] for i in value['items']}
+
+
+def test_an_old_claude_cannot_be_read(tmp_path, monkeypatch):
+    monkeypatch.setattr(vendor_guidance, 'run_pipe_process', lambda argv, **o: (PHYSICAL, b'2.1.321', b''))
+    with pytest.raises(ValueError, match='2.1.322'):
+        vendor_guidance.read('cli://claude', str(tmp_path/'claude.exe'))
+    assert normalized('cc_version=2.1.321.b46;') == 'cc_version=<CLI version>;'
 
 
 def test_transport_texts_are_what_the_codecs_build():
@@ -138,7 +225,7 @@ def test_transport_texts_are_what_the_codecs_build():
     assert texts['agy-action-guidance']['text'] == native_cli.AGY_ACTION_GUIDANCE
     assert texts['codex-structured']['text'].startswith(
         'Tare role guidance for choosing the external decision:\n<role guidance>')
-    assert all(t['endpoint'] in catalog() and t['title'] and t['text'] for t in texts.values())
+    assert all(t['endpoint'] in native_cli.CLI_MINIMUM and t['title'] and t['text'] for t in texts.values())
 
 
 def test_agy_offers_nothing_to_choose(tmp_path):
@@ -150,7 +237,8 @@ def test_agy_offers_nothing_to_choose(tmp_path):
 @pytest.mark.parametrize('codec', ['claude-native', 'claude-plain', 'claude-summary', 'claude-toolless',
                                    'claude-structured'])
 def test_claude_choices_travel_as_a_mod_with_hooks_on_and_nothing_else_changes(tmp_path, monkeypatch, codec):
-    choices = {'user_email': None, 'environment': None, 'date': 'Today is a working day.'}
+    choices = {'context:userEmail': None, 'attachment:environment': None,
+               'attachment:date': 'Today is a working day.'}
     seen = dispatched(tmp_path, monkeypatch, codec, version=CLAUDE_MEASURED, switches=WITH_MOD,
                       vendor_guidance=choices)
     argv, files = list(seen['argv']), seen['files']
@@ -160,13 +248,15 @@ def test_claude_choices_travel_as_a_mod_with_hooks_on_and_nothing_else_changes(t
     assert 'const dropContext: string[] = ["userEmail"];' in source
     assert ('const attachments: Record<string, string | null> = '
             '{"date": "Today is a working day.", "environment": null};') in source
+    assert 'const reading: boolean = false;' in source  # a call marks nothing; only a reading does
     assert json.loads(files.pop('tare-guidance/hooks/hooks.json')) == {'modules': ['./register.ts']}
     assert json.loads(files.pop('tare-guidance/.claude-plugin/plugin.json'))['name'] == 'tare-guidance'
     settings = json.loads(argv[argv.index('--settings') + 1])
     assert 'disableAllHooks' not in settings and settings['enabledPlugins'] == {}  # the mod's hooks can run
     turned_on = codec != 'claude-native'  # the native codec with tools already runs with hooks on
     assert seen['receipt']['vendor_guidance'] == {
-        'choices': {'date': 'replace', 'environment': 'remove', 'user_email': 'remove'}, 'sha256': sha(choices),
+        'choices': {'attachment:date': 'replace', 'attachment:environment': 'remove',
+                    'context:userEmail': 'remove'}, 'sha256': sha(choices),
         'hooks_turned_on': turned_on}
     # Only the mod and, where tare keeps hooks off, that switch differ from a call without a choice.
     if turned_on:
@@ -189,7 +279,7 @@ def test_the_receipt_says_whether_claude_listed_the_mod_at_init(tmp_path, monkey
         return PHYSICAL, '\n'.join(json.dumps(r) for r in rows).encode(), b''
     monkeypatch.setattr(native_cli, 'run_pipe_process', process)
     cli = native_cli.VendorCliClient('cli://claude', executable=str(tmp_path/'claude.exe'), version=CLAUDE_MEASURED,
-                                     qualification=AnyQualified(), vendor_guidance={'date': None})
+                                     qualification=AnyQualified(), vendor_guidance={'attachment:date': None})
     _, receipt = cli.post_observed('', native_cli.cli_request(json.loads(json.dumps(CHAT)), native=True), execution())
     assert receipt['vendor_guidance']['mod_listed_at_init'] is True
 
@@ -199,7 +289,7 @@ def test_the_receipt_says_whether_claude_listed_the_mod_at_init(tmp_path, monkey
                                                     'CLI_CAPABILITY_UNAVAILABLE')])
 def test_a_claude_that_cannot_load_the_mod_is_refused_before_dispatch(tmp_path, monkeypatch, version, switches, code):
     seen = dispatched(tmp_path, monkeypatch, 'claude-native', version=version, switches=switches,
-                      vendor_guidance={'date': None}, expect=ModelFailure)
+                      vendor_guidance={'attachment:date': None}, expect=ModelFailure)
     assert seen['error'].code == code and seen['error'].not_started and 'argv' not in seen
 
 

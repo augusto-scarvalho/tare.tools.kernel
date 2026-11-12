@@ -92,11 +92,12 @@ def user_instructions(env):
 def prompt_input(executable, root, body, catalog, features, guidance, control, run_process, receipt):
     """What Codex would show the model under this call's configuration, from its own `debug prompt-input`: nothing
     is sent, and an empty CODEX_HOME means no login or user configuration is read."""
+    from .vendor_guidance import READING_PROMPT
     home = root/'prompt-input'
     home.mkdir(exist_ok=True)
     args = prepare(home, body, catalog, features=features, guidance=guidance)
     config = [a for i, a in enumerate(args) if a == '-c' or i and args[i-1] == '-c']
-    return _inspect(executable, ['debug', 'prompt-input', *config, 'Tare checks what Codex adds.'], home,
+    return _inspect(executable, ['debug', 'prompt-input', *config, READING_PROMPT], home,
                     dict(os.environ, CODEX_HOME=str(home)), control, run_process, receipt,
                     seconds=30, max_output=1024*1024).decode('utf-8')
 
