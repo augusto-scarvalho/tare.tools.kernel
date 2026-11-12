@@ -667,13 +667,74 @@ def decode_claude_native(rows, hooks, model, tools):
         {'id': u['id'], 'name': u['name'][len(NATIVE_PREFIX):], 'arguments': u['input']} for u in uses]}), model, usage)
 
 
+
+# No accidental API-key route or provider redirect. The official CLI owns login.
+CLEARED_ENVIRONMENT = ('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN',
+                       'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX',
+                       'CLAUDE_CODE_USE_FOUNDRY', 'GOOGLE_API_KEY', 'GEMINI_API_KEY',
+                       'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'CODEX_API_KEY',
+                       'CLAUDE_CODE_EFFORT_LEVEL', 'CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING',
+                       'MAX_THINKING_TOKENS')
+
+
+def cli_env():
+    return {k: v for k, v in os.environ.items() if k not in CLEARED_ENVIRONMENT}
+
+
+def claude_invocation(executable, root, body, env, guidance, *, tag=False):
+    """Tare's Claude Code command for one request: (argv, stdin text, whether hooks were turned on for a mod). The
+    owner's choices (vendor_guidance.py), and for a reading the block tags, travel as a mod; env is completed here."""
+    mcp, settings = {'mcpServers': {}}, {'disableAllHooks': True, 'enabledPlugins': {}}
+    if body.get('native_tools'):
+        # Built-in tools stay disabled and user settings unread; only Tare's declaration-only
+        # server and recording hook are configured. Tool search would defer the schemas.
+        (root/'tools.json').write_text(encode(body['native_tools']), encoding='utf-8')
+        server = Path(__file__).with_name('native_cli_mcp.py').resolve()
+        hook = Path(__file__).with_name('native_cli_hook.py').resolve()
+        mcp = {'mcpServers': {'tare': {'command': sys.executable,
+                                       'args': ['-I', str(server), str(root/'tools.json')]}}}
+        # Claude Code runs hook commands through a shell (Git Bash on Windows): unquoted
+        # backslash paths lost their separators and the CLI's permission prompt refused instead.
+        command = ' '.join('"' + Path(part).as_posix() + '"' for part in
+                           (sys.executable, '-I', hook, root/'boundary.jsonl', 'claude'))
+        settings = {'enabledPlugins': {}, 'hooks': {'PreToolUse': [{'matcher': '*', 'hooks': [
+            {'type': 'command', 'command': command}]}]}}
+        env['ENABLE_TOOL_SEARCH'] = 'false'
+    modded = bool(guidance) or tag
+    # The mod's hooks run only with hooks on. Turning them on also runs the hooks of the plugins Claude Code builds
+    # in, which neither --setting-sources '' nor enabledPlugins {} excludes (2.1.322: cc-plugin-agents-md,
+    # -telemetry, -privacy, -plugin-authoring). The native codec with tools already runs them on every call; calls
+    # without tools (summaries, plain text) take that exposure only while the owner has a Claude choice saved.
+    # Measured on 2.1.322: with hooks on, the request was otherwise unchanged (tools/vendor_guidance_capture.py).
+    turned_on = modded and bool(settings.pop('disableAllHooks', False))
+    argv = [executable, '-p', '--model', body['model'], '--effort', body['effort'],
+            '--tools', '', '--strict-mcp-config', '--mcp-config', encode(mcp),
+            '--setting-sources', '', '--settings', encode(settings),
+            '--disable-slash-commands', '--no-chrome', '--no-session-persistence',
+            '--output-format', 'stream-json', '--input-format', 'stream-json',
+            '--verbose', '--system-prompt', body['system']]
+    if 'response_schema' in body:
+        argv += ['--json-schema', encode(body['response_schema']), '--max-turns', '2']
+    if modded:
+        from .vendor_guidance import claude_mod
+        argv += ['--plugin-dir', str(claude_mod(root, guidance or {}, tag=tag))]
+    from .native_cli_claude import input_record
+    return argv, encode(input_record(body)) + '\n', turned_on
+
+
 class VendorCliClient:
     def __init__(self, endpoint, *, executable, version, timeout_seconds=120,
-                 request_byte_limit=1024*1024, model_catalog=None, qualification=None, **unused_transport):
+                 request_byte_limit=1024*1024, model_catalog=None, qualification=None, vendor_guidance=None,
+                 **unused_transport):
         if (endpoint not in CLI_MINIMUM or not Path(executable).is_absolute()
                 or Path(executable).suffix.lower() in {'.cmd', '.bat'} or not version):
             raise ValueError('explicit vendor executable and reference version required')
         version_tuple(version)
+        from .vendor_guidance import validate
+        # The owner's choices about the blocks this CLI adds on its own (vendor_guidance.py). None or {} sends
+        # exactly what tare sent before they existed; AGY offers nothing to choose, so any choice is refused here.
+        self.vendor_guidance = validate(endpoint, vendor_guidance)
+        self._codex_guidance = {}  # version -> item ids `codex debug prompt-input` did not prove removed
         if (endpoint == 'cli://codex') != isinstance(model_catalog, dict):
             raise ValueError('Codex requires an explicit model catalog record')
         self.model_catalog = model_catalog
@@ -831,6 +892,14 @@ class VendorCliClient:
                 if version_tuple(actual) < version_tuple(minimum):
                     receipt['minimum_client_version'] = minimum
                     raise ModelFailure('CLI_INCOMPATIBLE_VERSION', not_started=True)
+                guided = bool(self.vendor_guidance)
+                if guided:
+                    from .vendor_guidance import CLAUDE_GUIDANCE_MINIMUM, receipt as guidance_receipt
+                    receipt['vendor_guidance'] = guidance_receipt(self.vendor_guidance)
+                    if (self.endpoint == 'cli://claude'
+                            and version_tuple(actual) < version_tuple(CLAUDE_GUIDANCE_MINIMUM)):
+                        receipt['vendor_guidance']['minimum_client_version'] = CLAUDE_GUIDANCE_MINIMUM
+                        raise ModelFailure('CLI_GUIDANCE_UNSUPPORTED', not_started=True)
                 if (self.endpoint in CLI_SWITCHES
                         and actual not in self._checked_versions):
                     help_args = ['exec', '--help'] if self.endpoint == 'cli://codex' else ['--help']
@@ -838,7 +907,10 @@ class VendorCliClient:
                         timeout=min(10, control.remaining_seconds()), cancelled=control.should_stop,
                         max_output=128*1024)
                     switches = set(re.findall(r'--[a-z][a-z-]*', (help_raw + b'\n' + help_errors).decode('utf-8')))
-                    missing = sorted(CLI_SWITCHES[self.endpoint] - switches)
+                    # The owner's Claude choices travel as a mod: without --plugin-dir they cannot be applied.
+                    required = CLI_SWITCHES[self.endpoint] | (
+                        {'--plugin-dir'} if guided and self.endpoint == 'cli://claude' else set())
+                    missing = sorted(required - switches)
                     if not probe['cleanup_verified']:
                         receipt['cleanup_verified'] = False
                         raise NativeTransportInterrupted('CLI_CLEANUP_UNCONFIRMED', receipt)
@@ -863,15 +935,7 @@ class VendorCliClient:
                     if actual not in self._codex_features:
                         self._codex_features[actual] = discover(self.executable, root, control, run_pipe_process, receipt)
                     receipt['cli_feature_count'] = len(self._codex_features[actual])
-                env = dict(os.environ)
-                # No accidental API-key route or provider redirect. The official CLI owns login.
-                for key in ('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN',
-                            'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX',
-                            'CLAUDE_CODE_USE_FOUNDRY', 'GOOGLE_API_KEY', 'GEMINI_API_KEY',
-                            'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'CODEX_API_KEY',
-                            'CLAUDE_CODE_EFFORT_LEVEL', 'CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING',
-                            'MAX_THINKING_TOKENS'):
-                    env.pop(key, None)
+                env = cli_env()
                 if self.endpoint == 'cli://agy':
                     prepare_agy(root, body['system'])
                     argv = [self.executable, '--add-dir', str(root), '--agent', 'tare-inference',
@@ -883,40 +947,27 @@ class VendorCliClient:
                     source = encode({'event': 'user', 'message': {
                         'content': body['prompt'] + body.get('reminder', '')}})+'\n'
                 elif self.endpoint == 'cli://claude':
-                    mcp, settings = {'mcpServers': {}}, {'disableAllHooks': True, 'enabledPlugins': {}}
-                    if body.get('native_tools'):
-                        # Built-in tools stay disabled and user settings unread; only Tare's declaration-only
-                        # server and recording hook are configured. Tool search would defer the schemas.
-                        (root/'tools.json').write_text(encode(body['native_tools']), encoding='utf-8')
-                        server = Path(__file__).with_name('native_cli_mcp.py').resolve()
-                        hook = Path(__file__).with_name('native_cli_hook.py').resolve()
-                        mcp = {'mcpServers': {'tare': {'command': sys.executable,
-                                                       'args': ['-I', str(server), str(root/'tools.json')]}}}
-                        # Claude Code runs hook commands through a shell (Git Bash on Windows): unquoted
-                        # backslash paths lost their separators and the CLI's permission prompt refused instead.
-                        command = ' '.join('"' + Path(part).as_posix() + '"' for part in
-                                           (sys.executable, '-I', hook, root/'boundary.jsonl', 'claude'))
-                        settings = {'enabledPlugins': {}, 'hooks': {'PreToolUse': [{'matcher': '*', 'hooks': [
-                            {'type': 'command', 'command': command}]}]}}
-                        env['ENABLE_TOOL_SEARCH'] = 'false'
-                    argv = [self.executable, '-p', '--model', body['model'], '--effort', body['effort'],
-                            '--tools', '', '--strict-mcp-config', '--mcp-config', encode(mcp),
-                            '--setting-sources', '', '--settings', encode(settings),
-                            '--disable-slash-commands', '--no-chrome', '--no-session-persistence',
-                            '--output-format', 'stream-json', '--input-format', 'stream-json',
-                            '--verbose', '--system-prompt', body['system']]
-                    if 'response_schema' in body:
-                        argv += ['--json-schema', encode(body['response_schema']), '--max-turns', '2']
-                    from .native_cli_claude import input_record
-                    source = encode(input_record(body)) + '\n'
+                    argv, source, turned_on = claude_invocation(self.executable, root, body, env,
+                                                                self.vendor_guidance)
+                    if guided:
+                        receipt['vendor_guidance']['hooks_turned_on'] = turned_on
                 else:
-                    from .native_cli_codex import prepare, user_instructions
+                    from .native_cli_codex import prepare, unproved_removals, user_instructions
                     present = user_instructions(env)
                     if present:  # they would reach every role's call: refused before anything is sent
                         receipt['user_instructions'] = present
                         raise ModelFailure('CLI_USER_INSTRUCTIONS_PRESENT', not_started=True)
+                    if guided:
+                        if actual not in self._codex_guidance:  # once per release, like its feature table
+                            self._codex_guidance[actual] = unproved_removals(
+                                self.executable, root, body, self.model_catalog, self._codex_features[actual],
+                                self.vendor_guidance, control, run_pipe_process, receipt)
+                        if self._codex_guidance[actual]:
+                            receipt['vendor_guidance']['unproved'] = self._codex_guidance[actual]
+                            raise ModelFailure('CLI_GUIDANCE_UNSUPPORTED', not_started=True)
                     argv = [self.executable, *prepare(root, body, self.model_catalog,
-                                                    features=self._codex_features[actual])]
+                                                    features=self._codex_features[actual],
+                                                    guidance=self.vendor_guidance)]
                     source = body['prompt']
                 try:
                     completion = (AgyCompletion(root, body['model'], 'response_schema' in body)
@@ -949,6 +1000,11 @@ class VendorCliClient:
                         and t['name'] in known else 'unknown' for t in tools})
                     response = decode_agy(rows, hooks, body['model'], structured='response_schema' in body)
                 elif self.endpoint == 'cli://claude':
+                    if guided:  # 2.1.322's init row lists loaded plugins by name; it says nothing of their hooks
+                        initial = [r for r in rows if r.get('type') == 'system' and r.get('subtype') == 'init']
+                        receipt['vendor_guidance']['mod_listed_at_init'] = (any(
+                            isinstance(p, dict) and p.get('name') == 'tare-guidance'
+                            for p in initial[0].get('plugins') or []) if len(initial) == 1 else None)
                     assistants = [r.get('message', {}) for r in rows if r.get('type') == 'assistant']
                     receipt['assistant_events'] = len(assistants)
                     receipt['assistant_message_ids'] = len({m['id'] for m in assistants

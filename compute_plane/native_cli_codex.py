@@ -32,24 +32,30 @@ def feature_args(features):
     return ['-c', 'features={'+table+'}']
 
 
+def _inspect(executable, args, cwd, env, control, run_process, receipt, *, seconds=10, max_output=128*1024):
+    """One local Codex command that sends no request; any failure is a capability Tare cannot confirm."""
+    physical, raw, _ = run_process([executable, *args], cwd=cwd, env=env,
+        timeout=min(seconds, control.remaining_seconds()), cancelled=control.should_stop, max_output=max_output)
+    if physical.get('cleanup_verified') and (physical.get('cancelled') or control.should_stop()):
+        receipt['cancelled'] = True
+        raise NativeTransportInterrupted('CLI_CANCELLED', receipt)
+    if not physical['cleanup_verified']:
+        receipt['cleanup_verified'] = False
+        raise NativeTransportInterrupted('CLI_CLEANUP_UNCONFIRMED', receipt)
+    if (physical['exit_code'] != 0
+            or any(physical.get(k) for k in ('cancelled', 'timeout', 'output_limit'))):
+        raise ModelFailure('CLI_CAPABILITY_UNAVAILABLE', not_started=True)
+    return raw
+
+
 def discover(executable, root, control, run_process, receipt):
     # Discovery needs no login and cannot inherit a user's feature defaults.
     home = root/'feature-probe'
     home.mkdir()
     env = dict(os.environ, CODEX_HOME=str(home))
     def probe(args):
-        physical, raw, _ = run_process([executable, 'features', 'list', *args], cwd=root, env=env,
-            timeout=min(10, control.remaining_seconds()), cancelled=control.should_stop, max_output=128*1024)
-        if physical.get('cleanup_verified') and (physical.get('cancelled') or control.should_stop()):
-            receipt['cancelled'] = True
-            raise NativeTransportInterrupted('CLI_CANCELLED', receipt)
-        if not physical['cleanup_verified']:
-            receipt['cleanup_verified'] = False
-            raise NativeTransportInterrupted('CLI_CLEANUP_UNCONFIRMED', receipt)
-        if (physical['exit_code'] != 0
-                or any(physical.get(k) for k in ('cancelled', 'timeout', 'output_limit'))):
-            raise ModelFailure('CLI_CAPABILITY_UNAVAILABLE', not_started=True)
-        return feature_states(raw)
+        return feature_states(_inspect(executable, ['features', 'list', *args], root, env, control, run_process,
+                                       receipt))
     states = probe([])
     # Sending deprecated overrides emits error items even for ignored settings.
     # Omit them, but still require their effective state to remain disabled.
@@ -83,7 +89,29 @@ def user_instructions(env):
     return found
 
 
-def prepare(root, body, catalog, *, features):
+def prompt_input(executable, root, body, catalog, features, guidance, control, run_process, receipt):
+    """What Codex would show the model under this call's configuration, from its own `debug prompt-input`: nothing
+    is sent, and an empty CODEX_HOME means no login or user configuration is read."""
+    from .vendor_guidance import READING_PROMPT
+    home = root/'prompt-input'
+    home.mkdir(exist_ok=True)
+    args = prepare(home, body, catalog, features=features, guidance=guidance)
+    config = [a for i, a in enumerate(args) if a == '-c' or i and args[i-1] == '-c']
+    return _inspect(executable, ['debug', 'prompt-input', *config, READING_PROMPT], home,
+                    dict(os.environ, CODEX_HOME=str(home)), control, run_process, receipt,
+                    seconds=30, max_output=1024*1024).decode('utf-8')
+
+
+def unproved_removals(executable, root, body, catalog, features, guidance, control, run_process, receipt):
+    """Codex can only leave a block out, and an older release may ignore a key it does not know. Each chosen block
+    must show in `debug prompt-input` without its switch and not with it; returns the item ids that did not."""
+    from .vendor_guidance import codex_switches
+    before, after = (prompt_input(executable, root, body, catalog, features, choices, control, run_process, receipt)
+                     for choices in ({}, guidance))
+    return sorted(k for k, (_, tag) in codex_switches(guidance).items() if tag not in before or tag in after)
+
+
+def prepare(root, body, catalog, *, features, guidance=None):
     model = json.loads(encode(catalog))
     if model.get('slug') != body['model']:
         raise ModelFailure('CLI_CATALOG_MODEL_MISMATCH', not_started=True)
@@ -98,6 +126,8 @@ def prepare(root, body, catalog, *, features):
               'project_doc_max_bytes': 0, 'developer_instructions': '', 'notify': [],
               'tools.update_plan.enabled': False, 'tools.experimental_request_user_input.enabled': False,
               'suppress_unstable_features_warning': True}
+    from .vendor_guidance import codex_switches
+    config.update({key: False for key, _ in codex_switches(guidance or {}).values()})  # the owner's removals
     args = ['exec', '--ignore-user-config', '--ephemeral', '--skip-git-repo-check',
             '--cd', str(root.parent), '--json', '-m', body['model'], '-s', 'read-only']
     if 'response_schema' in body:

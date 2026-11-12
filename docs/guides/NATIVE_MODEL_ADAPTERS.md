@@ -5,6 +5,8 @@ Gemini's OpenAI-compatible usage has a separate
 unknown cache details. HTTP compatibility does not establish OpenAI token semantics.
 
 This guide describes the native adapter interfaces and their bounded behavior.
+What each vendor CLI adds to tare's requests on its own, and how the owner removes or replaces it, is in
+[Vendor guidance](../VENDOR_GUIDANCE.md).
 
 Terminal output is paged in decoded characters per stream. Each successful
 `terminal_read` supplies `next_read` arguments to copy for the next observation;

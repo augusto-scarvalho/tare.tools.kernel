@@ -34,6 +34,7 @@ The Kernel executes model calls and their effects for tare.tools.os. Start with 
 ## Native execution
 
 * [Native model adapters](guides/NATIVE_MODEL_ADAPTERS.md)
+* [Vendor guidance: what a vendor CLI adds on its own](VENDOR_GUIDANCE.md)
 * [Gemini compatibility usage](guides/GEMINI_COMPAT_USAGE.md)
 * [Native input attachments](NATIVE_ATTACHMENTS.md)
 * [Invalid edit hashes and nullable arguments](NATIVE_HASH_DIAGNOSTIC.md)
