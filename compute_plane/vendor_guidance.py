@@ -4,7 +4,9 @@ Tare replaces each CLI's main prompt, yet the CLI still adds blocks of its own. 
 it adds now, with zero tokens: Claude Code runs with tare's own flags against a recorder on this machine
 (127.0.0.1) that answers every request with an error, so the login token never leaves the machine and nothing
 reaches the provider; Codex renders the model's input with its own `debug prompt-input`, which sends nothing.
-Machine and day values become placeholders, so two readings of one CLI give the same texts. A choice maps an item
+`read_real()` makes one minimal real call, only when asked by name: Claude Code with tare's mod recording every
+piece, AGY from its own record of that call. Machine and day values become placeholders, so two readings of one CLI
+give the same texts. A choice maps an item
 id to None (leave the block out) or a text sent in its place; VendorCliClient applies it and refuses, before
 anything is sent, one its CLI cannot honour. `transport_texts()` shows the protocol texts tare itself sends.
 """
@@ -29,6 +31,9 @@ CLAUDE_MOD = '''import type { Register } from 'claude-code';
 const dropContext: string[] = __TARE_DROP__;
 const attachments: Record<string, string | null> = __TARE_ATTACHMENTS__;
 const reading: boolean = __TARE_READING__;
+// A real reading: every piece, as sent, goes to its own file (hooks run concurrently; writes to one file interleave).
+const recording: boolean = __TARE_RECORDING__;
+let pieces = 0;
 // Placeholder -> pattern whose first group is that value in the CLI's own text for the same block.
 const fill: [string, string][] = __TARE_FILL__;
 // An empty block stays empty: a mark would make Claude Code send a block it otherwise leaves out.
@@ -36,10 +41,11 @@ const mark = (kind: string, name: string, text: string) =>
   reading && text ? `<<tare ${kind} ${name}>>${text}<</tare ${kind}>>` : text;
 
 export const register: Register = (on) => {
-  on('prompt.context', async ($, e, next) => ({
-    blocks: (await next(e)).blocks.filter((b) => !dropContext.includes(b.name))
-      .map((b) => ({ ...b, text: mark('context', b.name, b.text) })),
-  }));
+  on('prompt.context', async ($, e, next) => {
+    const blocks = (await next(e)).blocks.filter((b) => !dropContext.includes(b.name));
+    if (recording) await $.fs.write(`guidance-record/${++pieces}.json`, JSON.stringify({ kind: 'context', blocks }));
+    return { blocks: blocks.map((b) => ({ ...b, text: mark('context', b.name, b.text) })) };
+  });
   on('prompt.attachment', async ($, e, next) => {
     const own = Object.hasOwn(attachments, e.type) && attachments[e.type] === null ? null : (await next(e)).text;
     let text = Object.hasOwn(attachments, e.type) ? attachments[e.type] : own;
@@ -48,6 +54,8 @@ export const register: Register = (on) => {
         const found = (own ?? '').match(new RegExp(pattern));
         if (found) text = text.split(name).join(found[1]);
       }
+    if (recording) await $.fs.write(`guidance-record/${++pieces}.json`,
+                                    JSON.stringify({ kind: 'attachment', type: e.type, text }));
     return { text: text === null ? null : mark('attachment', e.type, text) };
   });
 };
@@ -58,7 +66,7 @@ FILL = (('<date>', r'(\d{4}-\d{2}-\d{2})'), ('<OS version>', r'OS Version: (.+)'
         ('<working directory>', r'Primary working directory: (.+)'),
         ('<model name>', r'named (.+?)\. The exact model ID'), ('<model id>', r'The exact model ID is (.+?)\. Assistant'),
         ('<knowledge cutoff>', r'Assistant knowledge cutoff is (.+?)\.'),
-        ('<account email>', r'([\w.+-]+@[\w-]+(?:\.[\w-]+)+)'))
+        ('<account email>', r'([\w.+-]+@[\w-]+(?:\.[\w-]+)+)'), ('<tokens>', r'(\d[\d,]*) tokens left'))
 # Context blocks render inside an attachment (2.1.322: `session_context`), so each kind has its own end mark.
 MARKS = {kind: re.compile(rf'<<tare {kind} ([^>\s]+)>>(.*?)<</tare {kind}>>', re.S)
          for kind in ('context', 'attachment')}
@@ -78,12 +86,52 @@ NOTES = {
                     'Claude Code\'s hooks on, so while a Claude choice is saved, calls that tare normally runs with '
                     'hooks off also run the hooks of the plugins built into Claude Code. If the mod fails, Claude '
                     'Code sends its own text anyway.',
-    'cli://codex': 'Read with Codex\'s own `debug prompt-input`, which sends nothing, under tare\'s configuration '
-                   'and an empty CODEX_HOME; a real call also lists the skills installed in CODEX_HOME. Codex can '
+    'cli://codex': 'Read with Codex\'s own `debug prompt-input`, which sends nothing, as tare\'s real call would '
+                   'show it: the skills installed here, but neither your login nor your config.toml. Codex can '
                    'leave a block out but not rewrite it; tare proves each removal once per Codex version.',
-    'cli://agy': 'AGY offers no official way to see what it adds to a request, so nothing here can be read or '
-                 'changed.'}
+    'cli://agy': 'Read from the record AGY keeps of one small real call tare makes when a new AGY version appears. '
+                 'Nothing here can be changed.'}
 READING_PROMPT = 'Tare reads what this CLI adds on its own.'
+REAL_PROMPT = 'Reply with the text OK and nothing else.'
+# What one real AGY 1.5.7 call showed on 2026-11-12 (read_real), until a reading of the installed AGY replaces it.
+AGY_STARTING_POINT = {'cli': 'AGY', 'cli_version': '1.5.7', 'read_at': '2026-11-12', 'items': [
+    {'id': 'system:frame',
+     'title': "Frame around tare's system text",
+     'sent_as': 'system text',
+     'text': "<System Prompt>\n<tare's system text>\n</System Prompt>"},
+    {'id': 'request:frame',
+     'title': "Frame around tare's request",
+     'sent_as': 'user message',
+     'text': "<USER_REQUEST>\n<tare's request>\n</USER_REQUEST>"},
+    {'id': 'request:ADDITIONAL_METADATA',
+     'title': "Block <ADDITIONAL_METADATA> after tare's request",
+     'sent_as': "user message, after tare's request",
+     'text': 'The current local time is: <local time>.'},
+    {'id': 'request:USER_SETTINGS_CHANGE',
+     'title': "Block <USER_SETTINGS_CHANGE> after tare's request",
+     'sent_as': "user message, after tare's request",
+     'text': 'The user changed setting `Model Selection` from None to <model name>. No need to comment on this change '
+             "if the user doesn't ask about it. If reporting what model you are, please use a human readable name "
+             'instead of the exact string.'},
+    {'id': 'tool:finish',
+     'title': 'Tool "finish"',
+     'sent_as': 'tool definition',
+     'text': 'End your task and return its result. Only call this once you are confident the task is complete and '
+             'correct.'},
+    {'id': 'tool:manage_task',
+     'title': 'Tool "manage_task"',
+     'sent_as': 'tool definition',
+     'text': "Manage the background tasks of this conversation: 'list' the running tasks, check a task's 'status' and "
+             "recent log output, 'send_input' to a running task, or 'kill' one. Refer to tasks by the TaskId that "
+             "'list' reports; keep task references human-readable when talking to the user.\n"
+             '\n'
+             'Parameters: '
+             '{"$schema":"https://json-schema.org/draft/2020-12/schema","properties":{"Action":{"type":"string","enum":["list","kill","status","send_input"],"description":"\'list\' '
+             'reports the running tasks; the other actions operate on the task named in '
+             'TaskId."},"TaskId":{"type":"string","description":"Task to manage, as reported by \'list\'. Required '
+             'for \'kill\', \'status\' and \'send_input\'."},"Input":{"type":"string","description":"Input to deliver '
+             'to the task. Required for '
+             '\'send_input\'."}},"additionalProperties":false,"type":"object","required":["Action"]}'}]}
 EMAIL = re.compile(r'[\w.+-]+@[\w-]+(?:\.[\w-]+)+')
 
 
@@ -117,9 +165,9 @@ def receipt(choices):
             'sha256': sha(choices)}
 
 
-def claude_mod(root, choices, *, tag=False):
-    """Write the mod that applies validated Claude choices to one call (and, for a reading, marks every block);
-    returns the folder for --plugin-dir."""
+def claude_mod(root, choices, *, tag=False, record=False):
+    """Write the mod that applies validated Claude choices to one call (for a local reading it also marks every
+    block, for a real reading it records every piece as sent); returns the folder for --plugin-dir."""
     drop = sorted(k.partition(':')[2] for k in choices if k.startswith('context:'))
     attachments = {k.partition(':')[2]: v for k, v in choices.items() if k.startswith('attachment:')}
     folder = root/'tare-guidance'
@@ -131,6 +179,7 @@ def claude_mod(root, choices, *, tag=False):
     (folder/'hooks/hooks.json').write_text(encode({'modules': ['./register.ts']}), encoding='utf-8')
     (folder/'hooks/register.ts').write_text(
         CLAUDE_MOD.replace('__TARE_DROP__', json.dumps(drop)).replace('__TARE_READING__', json.dumps(tag))
+        .replace('__TARE_RECORDING__', json.dumps(record))
         .replace('__TARE_FILL__', json.dumps(FILL))
         .replace('__TARE_ATTACHMENTS__', json.dumps(attachments, sort_keys=True)), encoding='utf-8')
     return folder
@@ -148,14 +197,16 @@ def normalized(text, roots=()):
         for form in {str(root), Path(root).as_posix()}:
             text = re.sub(re.escape(form) + r'[^\s<>`"]*', '<working directory>', text)
     text = EMAIL.sub('<account email>', text)
+    text = re.sub(r'\d{4}-\d{2}-\d{2}T[\d:.]+(?:[+-]\d{2}:\d{2}|Z)?', '<local time>', text)
     text = re.sub(r'\d{4}-\d{2}-\d{2}', '<date>', text)
+    text = re.sub(r'\d[\d,]* tokens left', '<tokens> tokens left', text)
     text = re.sub(r'(OS Version: ).+', r'\1<OS version>', text)
     text = re.sub(r'named .+?\. The exact model ID is .+?\. Assistant knowledge cutoff is .+?\.',
                   'named <model name>. The exact model ID is <model id>. Assistant knowledge cutoff is '
                   '<knowledge cutoff>.', text)
     text = re.sub(r'cc_version=[^;\s]+;', 'cc_version=<CLI version>;', text)
     text = re.sub(r'<timezone>[^<]*</timezone>', '<timezone><time zone></timezone>', text)
-    return re.sub(r'(`r0` = `)[^`]*`', r'\1<skills folder>`', text)
+    return re.sub(r'(`r\d+` = `)[^`]*`', r'\1<skills folder>`', text)
 
 
 def claude_items(recorded, body, roots=()):
@@ -238,8 +289,8 @@ def read(endpoint, executable, *, choices=None, seconds=120):
         return _read_claude(executable, choices or {}, seconds)
     if endpoint == 'cli://codex':
         return _read_codex(executable, choices or {}, seconds)
-    controls(endpoint, '')
-    return {'cli': 'AGY', 'cli_version': None, 'note': NOTES[endpoint], 'items': []}
+    controls(endpoint, '')  # AGY: no zero-token reading, only its version, which says when a real one is due
+    return {'cli': 'AGY', 'cli_version': _version(executable), 'note': NOTES[endpoint], 'items': []}
 
 
 def _read_claude(executable, choices, seconds):
@@ -309,6 +360,198 @@ def _read_codex(executable, choices, seconds):
                                 run_pipe_process, receipt)
         items = codex_items(rendered, [root])
     return {'cli': 'Codex', 'cli_version': version, 'note': NOTES['cli://codex'], 'items': items}
+
+
+def read_real(endpoint, executable, *, model, choices=None, seconds=180):
+    """What the CLI adds in one minimal real call. It spends tokens, so it is never part of `read`: the caller names
+    the cheapest model and makes it once per CLI version. Returns a reading as `read` does, plus the call's
+    'usage'. Claude Code: tare's own command and mod, which records every piece as sent; each item says whether the
+    zero-token reading found it (`local`: same, differs, absent) and `left_out` names what a choice removed. AGY: its
+    own record of that call. ValueError when the CLI cannot be read."""
+    if endpoint == 'cli://claude':
+        return _real_claude(executable, model, validate(endpoint, choices), seconds)
+    if endpoint == 'cli://agy':
+        return _real_agy(executable, model, seconds)
+    raise ValueError(f'{endpoint} has no real reading: its zero-token reading matched a real call.')
+
+
+def _real_claude(executable, model, choices, seconds):
+    from .native_cli import claude_invocation, cli_env, cli_request
+    local = _read_claude(executable, choices, seconds)  # also refuses a CLI too old to be read
+    known = {item['id']: item for item in local['items']}
+    with tempfile.TemporaryDirectory(prefix='tare-reading-') as folder:
+        root = Path(folder)
+        body = cli_request({'model': model, 'effort': 'low', 'tools': [],
+                            'messages': [{'role': 'user', 'content': REAL_PROMPT}]}, native=True)
+        env = cli_env()
+        argv, source, _ = claude_invocation(executable, root, body, env, choices, record=True)
+        _, raw, _ = run_pipe_process(argv, cwd=root, env=env, timeout=seconds, stdin=source.encode('utf-8'),
+                                     max_output=4*1024*1024)
+        result = {}
+        for line in raw.decode('utf-8', 'replace').splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict) and row.get('type') == 'result':
+                result = row
+        files = sorted((root/'guidance-record').glob('*.json'), key=lambda f: int(f.stem))
+        records = [json.loads(f.read_text(encoding='utf-8')) for f in files]
+    if result.get('is_error') is not False or not records:
+        raise ValueError(f'The real Claude Code call failed ({result.get("subtype") or "no result"}).')
+    # A context block is sent inside an attachment that frames it (2.1.322: session_context). One the engine replaces
+    # with its own attachment (currentDate: the date attachment, same text) is not sent as a block.
+    sent = [r['text'] for r in records if r['kind'] == 'attachment' and r['text']]
+    blocks = {b['name']: b['text'] for r in records if r['kind'] == 'context' for b in r['blocks']
+              if b['text'] and any(b['text'] in text and b['text'] != text for text in sent)}
+    items, left_out = [], []
+
+    def add(item_id, title, text):
+        if any(i['id'] == item_id for i in items):
+            return
+        text = normalized(text, [root])
+        mine = known.get(item_id)
+        items.append({'id': item_id, 'title': title, 'controls': controls('cli://claude', item_id), 'text': text,
+                      'sent_as': mine['sent_as'] if mine else 'sent with the request; seen only in a real call',
+                      'local': 'absent' if mine is None else 'same' if mine['text'] == text else 'differs'})
+    for record in records:
+        if record['kind'] == 'context':
+            for name in (b['name'] for b in record['blocks'] if b['name'] in blocks):
+                add(f'context:{name}', f'Context block "{name}"', blocks[name])
+        elif record['text'] is None:
+            left_out.append(f'attachment:{record["type"]}')
+        else:  # a context block renders inside an attachment: shown there by name, as the local reading does
+            text = record['text']
+            for name, block in blocks.items():
+                text = text.replace(block, f'<context {name}>')
+            add(f'attachment:{record["type"]}', f'Attachment "{record["type"]}"', text)
+    return {'cli': 'Claude Code', 'cli_version': local['cli_version'], 'note': NOTES['cli://claude'], 'items': items,
+            'left_out': left_out, 'usage': {**(result.get('usage') or {}),
+                                            'total_cost_usd': result.get('total_cost_usd')}}
+
+
+def _protobuf(data):
+    """[(field number, value)] of a protobuf message (length-delimited values as bytes), or None when it is not one.
+    AGY publishes no schema, so its record is read by the marks in its text, never by field numbers."""
+    fields, at = [], 0
+    try:
+        while at < len(data):
+            key, shift = 0, 0
+            while True:
+                key |= (data[at] & 0x7F) << shift
+                at, shift = at + 1, shift + 7
+                if not data[at - 1] & 0x80:
+                    break
+            number, kind = key >> 3, key & 7
+            if not 0 < number < 5000:
+                return None
+            if kind == 0:
+                while data[at] & 0x80:
+                    at += 1
+                at += 1
+                continue
+            if kind in (1, 5):
+                at += 8 if kind == 1 else 4
+                continue
+            if kind != 2:
+                return None
+            size, shift = 0, 0
+            while True:
+                size |= (data[at] & 0x7F) << shift
+                at, shift = at + 1, shift + 7
+                if not data[at - 1] & 0x80:
+                    break
+            if at + size > len(data):
+                return None
+            fields.append((number, data[at:at + size]))
+            at += size
+        return fields
+    except IndexError:
+        return None
+
+
+def agy_items(record, system, roots=()):
+    """The blocks AGY added in one generation record (gen_metadata.data of its conversation store): the frame
+    around tare's system text, the blocks after tare's request (`request:<TAG>`) and its tools (`tool:<name>`)."""
+    texts, tools = [], []
+
+    def walk(data):
+        fields = _protobuf(data) or []
+        strings = {}
+        for number, value in fields:
+            try:
+                strings.setdefault(number, value.decode('utf-8'))
+            except UnicodeDecodeError:
+                pass
+        if (re.fullmatch(r'[a-z_]+', strings.get(1, '')) and 2 in strings
+                and strings.get(3, '').startswith('{')):  # a tool: name, description, JSON schema
+            tools.append((strings[1], strings[2], strings[3]))
+        for number, value in fields:
+            text = strings.get(number)
+            if text is not None and ('<System Prompt>' in text or '<USER_REQUEST>' in text):
+                texts.append(text.replace('\r\n', '\n'))
+            elif len(value) > 2:
+                walk(value)
+    walk(record)
+    framed = next((t for t in texts if '<System Prompt>' in t and system.replace('\r\n', '\n') in t), None)
+    request = next((t for t in texts if '</USER_REQUEST>' in t), None)
+    if framed is None or request is None:
+        raise ValueError('AGY could not be read: its record of the call lacks tare\'s system text or request.')
+    asked, added = request.split('</USER_REQUEST>', 1)
+    items = [{'id': 'system:frame', 'title': 'Frame around tare\'s system text', 'sent_as': 'system text',
+              'text': framed.replace(system.replace('\r\n', '\n'), '<tare\'s system text>')},
+             {'id': 'request:frame', 'title': 'Frame around tare\'s request', 'sent_as': 'user message',
+              'text': asked.split('<USER_REQUEST>', 1)[0] + '<USER_REQUEST>\n<tare\'s request>\n</USER_REQUEST>'}]
+    # The model the call chose is named in the settings block: a placeholder, so readings with any model agree.
+    added = re.sub(r'(`Model Selection` from .+? to ).+?(\. )', r'\1<model name>\2', added)
+    for tag, inner in re.findall(r'<([A-Z_]+)>\n?(.*?)\n?</\1>', added, re.S):
+        items.append({'id': f'request:{tag}', 'title': f'Block <{tag}> after tare\'s request',
+                      'sent_as': 'user message, after tare\'s request', 'text': inner})
+    for name, description, schema in dict.fromkeys(tools):
+        items.append({'id': f'tool:{name}', 'title': f'Tool "{name}"', 'sent_as': 'tool definition',
+                      # finish carries tare's response schema; only its description is AGY's
+                      'text': description if name == 'finish' else f'{description}\n\nParameters: {schema}'})
+    return [{**item, 'controls': (), 'text': normalized(item['text'], roots)} for item in items]
+
+
+def _real_agy(executable, model, seconds):
+    import shutil
+    import sqlite3
+    from .native_cli import AgyCompletion, agy_invocation, cli_env, cli_request
+    version = _version(executable)
+    with tempfile.TemporaryDirectory(prefix='tare-reading-') as folder:
+        root = Path(folder)
+        body = cli_request({'model': model, 'effort': 'low',
+                            'messages': [{'role': 'user', 'content': REAL_PROMPT}]}, structured=True)
+        argv, source = agy_invocation(executable, root/'call', body, seconds)
+        completion = AgyCompletion(root/'call', model, True)
+        _, raw, _ = run_pipe_process(argv, cwd=root/'call', env=cli_env(), timeout=seconds + 30,
+                                     stdin=source.encode('utf-8'), max_output=4*1024*1024,
+                                     on_stdout=completion.feed, completed=completion.complete)
+        rows = []
+        for line in raw.decode('utf-8', 'replace').splitlines():
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                pass
+        conversation = next((r.get('conversation_id') for r in rows if isinstance(r, dict)
+                             and re.fullmatch(r'[0-9a-f-]{36}', str(r.get('conversation_id')))), None)
+        result = next((r['result'] for r in rows if isinstance(r, dict) and isinstance(r.get('result'), dict)), {})
+        # Only the conversation this call created, named by the id the call reported; never another one.
+        store = Path.home()/'.gemini'/'antigravity-cli'/'conversations'/f'{conversation}.db'
+        if conversation is None or not store.is_file():
+            raise ValueError('AGY could not be read: the call left no record of its own.')
+        shutil.copy(store, root/'conversation.db')  # AGY may still hold its own file
+        database = sqlite3.connect(root/'conversation.db')
+        try:
+            found = database.execute('select data from gen_metadata order by idx limit 1').fetchone()
+        finally:
+            database.close()
+        if not found:
+            raise ValueError('AGY could not be read: the call left no record of its own.')
+        items = agy_items(found[0], body['system'], [root])
+    return {'cli': 'AGY', 'cli_version': version, 'note': NOTES['cli://agy'], 'items': items,
+            'usage': result.get('usage')}
 
 
 def transport_texts():
