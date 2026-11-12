@@ -90,13 +90,27 @@ def user_instructions(env):
 
 
 def prompt_input(executable, root, body, catalog, features, guidance, control, run_process, receipt):
-    """What Codex would show the model under this call's configuration, from its own `debug prompt-input`: nothing
-    is sent, and an empty CODEX_HOME means no login or user configuration is read."""
+    """What Codex shows the model in tare's `exec` call, from its own `debug prompt-input`, which sends nothing.
+    Like the real call it lists the skills installed in CODEX_HOME (copied into an empty home, so neither the login
+    nor the owner's config.toml is read) under exec's approval policy and read-only sandbox. Codex 0.166.0: every
+    block equalled a real call's own session record (docs/VENDOR_GUIDANCE.md)."""
+    from pathlib import Path
     from .vendor_guidance import READING_PROMPT
     home = root/'prompt-input'
     home.mkdir(exist_ok=True)
+    skills = Path(os.environ.get('CODEX_HOME') or Path.home()/'.codex')/'skills'
+    # A skill may link to a whole project: only what decides its listing is copied, its SKILL.md, its
+    # agents/*.yaml (`policy.allow_implicit_invocation: false` keeps a skill out of the list) and a plugin manifest
+    # (its name prefixes the skill's).
+    for pattern in ('SKILL.md', 'agents/*.yaml', '.claude-plugin/plugin.json', '.codex-plugin/plugin.json'):
+        for source in [*skills.glob('*/' + pattern), *skills.glob('*/*/' + pattern)]:
+            target = home/'skills'/source.relative_to(skills)
+            if not target.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(source.read_bytes())
     args = prepare(home, body, catalog, features=features, guidance=guidance)
     config = [a for i, a in enumerate(args) if a == '-c' or i and args[i-1] == '-c']
+    config += ['-c', 'approval_policy="never"', '-c', 'sandbox_mode="read-only"']  # exec's, with `-s read-only`
     return _inspect(executable, ['debug', 'prompt-input', *config, READING_PROMPT], home,
                     dict(os.environ, CODEX_HOME=str(home)), control, run_process, receipt,
                     seconds=30, max_output=1024*1024).decode('utf-8')

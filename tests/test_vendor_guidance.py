@@ -337,17 +337,172 @@ def test_every_placeholder_of_a_claude_block_has_a_pattern_that_finds_its_value(
     attachment needs a FILL pattern that finds that value in the CLI's own text."""
     import re
     from compute_plane.vendor_guidance import FILL, normalized
-    own = ('# Environment\n - Primary working directory: C:\Temp\tare-reading-x\n - OS Version: Windows 11 10.0.1\n'
+    own = ('# Environment\n - Primary working directory: C:/Temp/tare-reading-x\n - OS Version: Windows 11 10.0.1\n'
            'The user\'s email address is someone@example.com.\n'
            'You are powered by the model named Sonnet 5.5. The exact model ID is claude-sonnet-5-5. '
-           'Assistant knowledge cutoff is June 2026.\n\nToday\'s date is 2026-11-12.')
-    shown = normalized(own, ['C:\Temp\tare-reading-x'])
+           'Assistant knowledge cutoff is June 2026.\n\nToday\'s date is 2026-11-12.\n'
+           '<total_tokens>15000000 tokens left</total_tokens>')
+    shown = normalized(own, ['C:/Temp/tare-reading-x'])
     values = {name: re.search(pattern, own)[1] for name, pattern in FILL}
     assert set(re.findall(r'<[a-zA-Z ]+>', shown)) == set(values)
     assert values == {'<date>': '2026-11-12', '<OS version>': 'Windows 11 10.0.1',
-                      '<working directory>': 'C:\Temp\tare-reading-x', '<model name>': 'Sonnet 5.5',
+                      '<working directory>': 'C:/Temp/tare-reading-x', '<model name>': 'Sonnet 5.5',
                       '<model id>': 'claude-sonnet-5-5', '<knowledge cutoff>': 'June 2026',
-                      '<account email>': 'someone@example.com'}
+                      '<account email>': 'someone@example.com', '<tokens>': '15000000'}
     for name, value in values.items():  # what the mod does, placeholder by placeholder, gives the CLI's text back
         shown = shown.replace(name, value)
     assert shown == own
+
+
+def test_a_real_claude_reading_records_each_piece_and_says_which_the_local_reading_missed(tmp_path, monkeypatch):
+    import urllib.error
+    import urllib.request
+    real = []
+
+    def process(argv, **options):
+        if argv[-1] == '--version':
+            return PHYSICAL, b'2.1.322 (Claude Code)', b''
+        root = options['cwd']
+        source = (root/'tare-guidance/hooks/register.ts').read_text(encoding='utf-8')
+        if 'ANTHROPIC_BASE_URL' in options['env']:  # the zero-token reading first
+            request = urllib.request.Request(options['env']['ANTHROPIC_BASE_URL'] + '/v1/messages',
+                                             data=json.dumps(recorded_claude(root)).encode(), method='POST')
+            with pytest.raises(urllib.error.HTTPError):
+                urllib.request.urlopen(request, timeout=10)
+            return PHYSICAL | {'protocol_complete': True}, b'', b''
+        real.append(argv)  # the real call: tare's mod records every piece as sent, one file each
+        assert 'const recording: boolean = true;' in source and 'const reading: boolean = false;' in source
+        assert 'disableAllHooks' not in json.loads(argv[argv.index('--settings') + 1])
+        email = "The user's email address is someone@example.com."
+        reminder = '<total_tokens>15000000 tokens left</total_tokens>'
+        pieces = [{'kind': 'context', 'blocks': [{'name': 'userEmail', 'text': email},
+                                                 {'name': 'currentDate', 'text': "Today's date is 2026-11-12."}]},
+                  {'kind': 'attachment', 'type': 'session_context',
+                   'text': 'As you answer, use this context:\n# userEmail\n' + email + '\n\nAttached by Claude Code.'},
+                  {'kind': 'attachment', 'type': 'date', 'text': "Today's date is 2026-11-12."},
+                  {'kind': 'attachment', 'type': 'total_tokens_reminder',
+                   'text': None if '"total_tokens_reminder": null' in source else reminder}]
+        (root/'guidance-record').mkdir()
+        for number, piece in enumerate(pieces, 1):
+            (root/'guidance-record'/f'{number}.json').write_text(json.dumps(piece), encoding='utf-8')
+        result = {'type': 'result', 'subtype': 'success', 'is_error': False, 'usage': {'output_tokens': 4},
+                  'total_cost_usd': 0.001}
+        return PHYSICAL, json.dumps(result).encode(), b''
+    monkeypatch.setattr(vendor_guidance, 'run_pipe_process', process)
+    value = vendor_guidance.read_real('cli://claude', str(tmp_path/'claude.exe'), model='claude-haiku-5-5')
+    items = {item['id']: item for item in value['items']}
+    # currentDate is sent as the engine's own date attachment, not as a block
+    assert list(items) == ['context:userEmail', 'attachment:session_context', 'attachment:date',
+                           'attachment:total_tokens_reminder']
+    assert {k: i['local'] for k, i in items.items()} == {
+        'context:userEmail': 'same', 'attachment:session_context': 'same', 'attachment:date': 'same',
+        'attachment:total_tokens_reminder': 'absent'}
+    assert items['attachment:total_tokens_reminder']['text'] == '<total_tokens><tokens> tokens left</total_tokens>'
+    assert value['usage'] == {'output_tokens': 4, 'total_cost_usd': 0.001} and len(real) == 1
+    removed = vendor_guidance.read_real('cli://claude', str(tmp_path/'claude.exe'), model='claude-haiku-5-5',
+                                        choices={'attachment:total_tokens_reminder': None})
+    assert removed['left_out'] == ['attachment:total_tokens_reminder']
+    assert 'attachment:total_tokens_reminder' not in {i['id'] for i in removed['items']}
+    with pytest.raises(ValueError, match='no real reading'):
+        vendor_guidance.read_real('cli://codex', 'codex.exe', model='gpt-6-luna')
+
+
+def protobuf(number, value):
+    """One length-delimited protobuf field, as AGY's record holds its texts."""
+    data = value.encode('utf-8') if isinstance(value, str) else value
+    out = bytearray()
+    for part in ((number << 3) | 2, len(data)):
+        while part > 0x7F:
+            out.append(part & 0x7F | 0x80)
+            part >>= 7
+        out.append(part)
+    return bytes(out) + data
+
+
+def agy_tool(name, text, schema):
+    return protobuf(8, protobuf(1, name) + protobuf(2, text) + protobuf(3, schema))
+
+
+def agy_record(system, prompt, *, marks=True):
+    """An AGY 1.5.7 generation record: tare's system text and request in AGY's frames, its blocks and tools."""
+    framed = '<System Prompt>\r\n' + system + '\r\n</System Prompt>' if marks else system
+    request = ('<USER_REQUEST>\n' + prompt + '\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: '
+               '2026-11-12T13:37:07-03:00.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting '
+               '`Model Selection` from None to Gemini 3.8 Flash (Low). No need to comment.\n</USER_SETTINGS_CHANGE>')
+    return protobuf(1, protobuf(1, framed) + protobuf(2, protobuf(3, request))
+                    + agy_tool('finish', 'End your task.', '{"type":"object"}')
+                    + agy_tool('manage_task', 'Manage background tasks.', '{"properties":{}}'))
+
+
+def test_an_agy_reading_finds_what_agy_added_by_its_marks_and_refuses_to_guess():
+    system = 'Line one of tare.\nLine two.'
+    items = {item['id']: item for item in vendor_guidance.agy_items(agy_record(system, '{"x":1}'), system)}
+    assert list(items) == ['system:frame', 'request:frame', 'request:ADDITIONAL_METADATA',
+                           'request:USER_SETTINGS_CHANGE', 'tool:finish', 'tool:manage_task']
+    assert items['system:frame']['text'] == "<System Prompt>\n<tare's system text>\n</System Prompt>"
+    assert items['request:ADDITIONAL_METADATA']['text'] == 'The current local time is: <local time>.'
+    assert 'from None to <model name>. No need' in items['request:USER_SETTINGS_CHANGE']['text']
+    assert items['tool:finish']['text'] == 'End your task.'  # its schema is tare's own
+    assert items['tool:manage_task']['text'] == 'Manage background tasks.\n\nParameters: {"properties":{}}'
+    assert all(item['controls'] == () for item in items.values())
+    with pytest.raises(ValueError, match='could not be read'):
+        vendor_guidance.agy_items(agy_record(system, '{}', marks=False), system)
+    assert [i['id'] for i in vendor_guidance.AGY_STARTING_POINT['items']] == list(items)
+
+
+def test_a_real_agy_reading_opens_only_the_conversation_its_call_reported(tmp_path, monkeypatch):
+    import sqlite3
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    store = tmp_path/'.gemini'/'antigravity-cli'/'conversations'
+    store.mkdir(parents=True)
+    ours = ['0f0e0d0c-0b0a-0908-0706-050403020100']
+
+    def process(argv, **options):
+        if argv[-1] == '--version':
+            return PHYSICAL, b'1.5.7', b''
+        agent = (options['cwd']/'.agents/agents/tare-inference/agent.md').read_text(encoding='utf-8')
+        if ours[0].startswith('0'):
+            database = sqlite3.connect(store/(ours[0] + '.db'))
+            database.execute('create table gen_metadata (idx integer, data blob)')
+            database.execute('insert into gen_metadata values (0, ?)', (agy_record(agent.split('---\n')[-1], '{}'),))
+            database.commit()
+            database.close()
+        rows = [{'event': 'init', 'conversation_id': ours[0], 'init': {}},
+                {'event': 'result', 'result': {'status': 'SUCCESS', 'usage': {'total_tokens': 758}}}]
+        return PHYSICAL, '\n'.join(json.dumps(r) for r in rows).encode(), b''
+    monkeypatch.setattr(vendor_guidance, 'run_pipe_process', process)
+    value = vendor_guidance.read_real('cli://agy', str(tmp_path/'agy.exe'), model='gemini-3.8-flash-low')
+    assert value['cli_version'] == '1.5.7' and value['usage'] == {'total_tokens': 758}
+    assert 'tool:manage_task' in {i['id'] for i in value['items']}
+    ours[0] = '1f1e1d1c-1b1a-1918-1716-151413121110'  # the call reports a conversation AGY never wrote
+    with pytest.raises(ValueError, match='no record of its own'):
+        vendor_guidance.read_real('cli://agy', str(tmp_path/'agy.exe'), model='gemini-3.8-flash-low')
+
+
+def test_the_codex_reading_lists_the_installed_skills_as_exec_does_without_login_or_config(tmp_path, monkeypatch):
+    from compute_plane.native_cli_codex import prompt_input
+    home = tmp_path/'codex-home'
+    skill = home/'skills'/'linked-project'
+    (skill/'agents').mkdir(parents=True)
+    (skill/'.claude-plugin').mkdir()
+    (skill/'SKILL.md').write_text('---\nname: x\n---\n', encoding='utf-8')
+    (skill/'agents/openai.yaml').write_text('policy:\n  allow_implicit_invocation: false\n', encoding='utf-8')
+    (skill/'.claude-plugin/plugin.json').write_text('{"name": "linked"}', encoding='utf-8')
+    (skill/'big-project-file.bin').write_bytes(b'0' * 1000)
+    (home/'config.toml').write_text('model = "other"\n', encoding='utf-8')
+    (home/'auth.json').write_text('{}', encoding='utf-8')
+    monkeypatch.setenv('CODEX_HOME', str(home))
+    seen = []
+
+    def process(argv, **options):
+        copy = Path(options['env']['CODEX_HOME'])
+        seen.append(sorted(p.relative_to(copy).as_posix() for p in copy.rglob('*') if p.is_file()))
+        assert 'approval_policy="never"' in argv and 'sandbox_mode="read-only"' in argv
+        return PHYSICAL, b'[]', b''
+    body = native_cli.cli_request({'model': 'fixture', 'messages': []}, structured=True, native_arguments=True)
+    (tmp_path/'root').mkdir()
+    prompt_input('codex.exe', tmp_path/'root', body, {'slug': 'fixture'}, (), {}, execution(), process, {})
+    assert [p for p in seen[0] if p.startswith('skills/')] == [
+        'skills/linked-project/.claude-plugin/plugin.json', 'skills/linked-project/SKILL.md',
+        'skills/linked-project/agents/openai.yaml']  # no project file
+    assert 'config.toml' not in seen[0] and 'auth.json' not in seen[0]  # no login, no owner's configuration

@@ -381,6 +381,18 @@ def prepare_agy(root, system):
     (plugin/'hooks.json').write_text(encode(hooks), encoding='utf-8')
 
 
+def agy_invocation(executable, root, body, timeout):
+    """Tare's AGY command for one request: (argv, stdin text). The agent and its boundary plugin go under root."""
+    prepare_agy(root, body['system'])
+    argv = [executable, '--add-dir', str(root), '--agent', 'tare-inference',
+            '--model', body['model'], '--effort', body['effort'],
+            '--disable-slash-commands', '--print-timeout', str(math.ceil(timeout))+'s',
+            '--output-format', 'stream-json', '--input-format', 'stream-json']
+    if 'response_schema' in body:
+        argv += ['--json-schema', encode(body['response_schema'])]
+    return argv, encode({'event': 'user', 'message': {'content': body['prompt'] + body.get('reminder', '')}})+'\n'
+
+
 def action_proposal(value, model, usage):
     if (not isinstance(value, dict) or set(value) != {'text', 'actions'}
             or not isinstance(value['text'], str) or not isinstance(value['actions'], list)):
@@ -681,9 +693,10 @@ def cli_env():
     return {k: v for k, v in os.environ.items() if k not in CLEARED_ENVIRONMENT}
 
 
-def claude_invocation(executable, root, body, env, guidance, *, tag=False):
+def claude_invocation(executable, root, body, env, guidance, *, tag=False, record=False):
     """Tare's Claude Code command for one request: (argv, stdin text, whether hooks were turned on for a mod). The
-    owner's choices (vendor_guidance.py), and for a reading the block tags, travel as a mod; env is completed here."""
+    owner's choices (vendor_guidance.py), and for a reading the block marks or the record of every piece, travel as a
+    mod; env is completed here."""
     mcp, settings = {'mcpServers': {}}, {'disableAllHooks': True, 'enabledPlugins': {}}
     if body.get('native_tools'):
         # Built-in tools stay disabled and user settings unread; only Tare's declaration-only
@@ -700,7 +713,7 @@ def claude_invocation(executable, root, body, env, guidance, *, tag=False):
         settings = {'enabledPlugins': {}, 'hooks': {'PreToolUse': [{'matcher': '*', 'hooks': [
             {'type': 'command', 'command': command}]}]}}
         env['ENABLE_TOOL_SEARCH'] = 'false'
-    modded = bool(guidance) or tag
+    modded = bool(guidance) or tag or record
     # The mod's hooks run only with hooks on. Turning them on also runs the hooks of the plugins Claude Code builds
     # in, which neither --setting-sources '' nor enabledPlugins {} excludes (2.1.322: cc-plugin-agents-md,
     # -telemetry, -privacy, -plugin-authoring). The native codec with tools already runs them on every call; calls
@@ -717,7 +730,7 @@ def claude_invocation(executable, root, body, env, guidance, *, tag=False):
         argv += ['--json-schema', encode(body['response_schema']), '--max-turns', '2']
     if modded:
         from .vendor_guidance import claude_mod
-        argv += ['--plugin-dir', str(claude_mod(root, guidance or {}, tag=tag))]
+        argv += ['--plugin-dir', str(claude_mod(root, guidance or {}, tag=tag, record=record))]
     from .native_cli_claude import input_record
     return argv, encode(input_record(body)) + '\n', turned_on
 
@@ -937,15 +950,7 @@ class VendorCliClient:
                     receipt['cli_feature_count'] = len(self._codex_features[actual])
                 env = cli_env()
                 if self.endpoint == 'cli://agy':
-                    prepare_agy(root, body['system'])
-                    argv = [self.executable, '--add-dir', str(root), '--agent', 'tare-inference',
-                            '--model', body['model'], '--effort', body['effort'],
-                            '--disable-slash-commands', '--print-timeout', str(math.ceil(timeout))+'s',
-                            '--output-format', 'stream-json', '--input-format', 'stream-json']
-                    if 'response_schema' in body:
-                        argv += ['--json-schema', encode(body['response_schema'])]
-                    source = encode({'event': 'user', 'message': {
-                        'content': body['prompt'] + body.get('reminder', '')}})+'\n'
+                    argv, source = agy_invocation(self.executable, root, body, timeout)
                 elif self.endpoint == 'cli://claude':
                     argv, source, turned_on = claude_invocation(self.executable, root, body, env,
                                                                 self.vendor_guidance)
