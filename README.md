@@ -50,7 +50,7 @@ The implemented code lives in `compute_plane/`, plus producer receipts in `assur
 | Session journal | `native_journal.py`: append-only JSONL per session, used for replay and recovery |
 | Git workspaces | `workspace.py` (linked worktrees with exact leases), `candidate_git.py` |
 | Processes and terminals | `managed_process.py`, `terminal_sessions.py`, `terminal_pty.py`, `terminal_host.py` |
-| Optional Windows confinement | `windows_mxc.py`, `codex_sandbox.py`, `confined_workspace.py` ([guide](docs/guides/CONFINED_EXECUTION.md)) |
+| Optional confinement | Windows: `windows_mxc.py`, `codex_sandbox.py`, `confined_workspace.py`; Linux: `linux_bwrap.py` (bubblewrap) ([guide](docs/guides/CONFINED_EXECUTION.md)) |
 | Producer receipts | `assurance_plane/producer_receipts.py`: Ed25519 receipts binding a producer to output bytes |
 | Context | `native_instructions.py`, `project_context_hooks.py` |
 
@@ -62,7 +62,7 @@ Limits stated plainly:
   the cockpit and the TUI live in tare.tools.os.
 - Project roots select working directories; they are **not a command sandbox**.
   Linked worktrees isolate Git changes; the optional confinement profiles above
-  are Windows-only and off unless a host injects them.
+  (Windows, and Linux with bubblewrap) are off unless a host injects them.
 
 ## Install and test
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tare-kernel"
-version = "0.9.88"
+version = "0.9.89"
 description = "Bounded model and tool execution for the tare.tools ecosystem"
 readme = "README.md"
 requires-python = ">=3.11"
