@@ -82,9 +82,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # How the runner is allowed to give bubblewrap its user namespace: a profile for bwrap alone (what tare
-        # tells a user to install), Ubuntu's own experimental profile, or the restriction lifted for every program.
-        allowance: [bwrap-profile, ubuntu-profile, sysctl]
+        # How the runner allows bubblewrap its user namespace while the restriction stays on for every other
+        # program: a profile for bwrap alone that only grants it (what tare tells a user to install), or Ubuntu's
+        # own bwrap-userns-restrict, which newer Ubuntu releases load by default. Lifting the restriction for
+        # every program (sysctl kernel.apparmor_restrict_unprivileged_userns=0) also works (measured 2026-11-13)
+        # and is not what a user should be told to do, so it is not run.
+        allowance: [bwrap-profile, ubuntu-profile]
     # Always a GitHub-hosted runner, never CI_RUNNER_LINUX: it lowers a kernel setting with sudo, which only a
     # throwaway machine may take. It proves compute_plane/linux_bwrap.py on stock Ubuntu.
     runs-on: ubuntu-24.04
@@ -153,15 +156,13 @@ jobs:
           sudo cp /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/
           sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
 
-      - name: Lift the AppArmor restriction for every program on this throwaway runner
-        if: (success() || steps.stock.outcome == 'failure') && matrix.allowance == 'sysctl'
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-
       - name: Record what the allowance changed (never fails)
         if: success() || steps.stock.outcome == 'failure'
         run: |
           echo "kernel.apparmor_restrict_unprivileged_userns: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo absent)"
-          if unshare -U true 2>/dev/null; then echo "another program (unshare -U): user namespace created"; else echo "another program (unshare -U): still refused"; fi
+          # The restriction lets any program create a user namespace but gives it no capabilities there: that is
+          # what stopped bubblewrap (it could not bring its loopback up). Another program must still be stopped.
+          if unshare -Urn ip link set lo up 2>/dev/null; then echo "another program (unshare -Urn ip link set lo up): allowed"; else echo "another program (unshare -Urn ip link set lo up): still refused"; fi
           if bwrap --unshare-user --unshare-net --ro-bind / / true; then echo "plain bwrap --unshare-user: works"; else echo "plain bwrap --unshare-user: refused (exit $?)"; fi
           sudo dmesg | grep 'apparmor="DENIED"' | tail -5 || true
 
