@@ -40,7 +40,7 @@ repository does today.
 |---|---|---|
 | AC-01 | `control_plane/` and `data_plane/` are empty packages, so there is no control-plane policy to enforce. HTTP model adapters take their endpoint and credentials from the caller (`NativeHttpClient` in `compute_plane/native_models.py`). | Not implemented. |
 | AC-02 | The Kernel keeps no state store; the session journal (`compute_plane/native_journal.py`) is append-only. Its only compare-and-swap advances one Git ref (`land_candidate_ref` in `compute_plane/candidate_git.py`, via `git update-ref <ref> <new> <old>`). State persistence lives in tare.tools.os. | Not implemented. |
-| AC-03 | Project roots are not a command sandbox. The optional Windows confinement profiles (`compute_plane/windows_mxc.py`, `codex_sandbox.py`, `confined_workspace.py`) apply only when a host injects them, and the documentation claims no hard sandbox. | Implemented as a stated boundary; confinement is optional and Windows-only. |
+| AC-03 | Project roots are not a command sandbox. The optional confinement profiles (on Windows `compute_plane/windows_mxc.py`, `codex_sandbox.py`, `confined_workspace.py`; on Linux `linux_bwrap.py`) apply only when a host injects them, and the documentation claims no hard sandbox. | Implemented as a stated boundary; confinement is optional, on Windows and on Linux with bubblewrap. |
 | AC-04 | `assurance_plane/producer_receipts.py` signs and verifies Ed25519 receipts over the SHA-256 of supplied output bytes. Nothing here attaches a receipt to every execution output; a host signs what it chooses. | Partial: signer and verifier only. |
 
 The ontology concepts `CASPersistence` and `MonotonicLeaseControl` are shared

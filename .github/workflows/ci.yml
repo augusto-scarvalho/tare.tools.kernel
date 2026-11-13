@@ -76,3 +76,74 @@ jobs:
           name: kernel-tests-${{ matrix.platform }}
           path: kernel-${{ matrix.platform }}.xml
           if-no-files-found: warn
+
+  linux-sandbox:
+    name: Linux sandbox (bubblewrap)
+    # Always a GitHub-hosted runner, never CI_RUNNER_LINUX: it lowers a kernel setting with sudo, which only a
+    # throwaway machine may take. It proves compute_plane/linux_bwrap.py on stock Ubuntu.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install the kernel with the pinned runtime and SpecGraph
+        run: >-
+          python -m pip install
+          "git+https://github.com/augusto-scarvalho/tare.tools.agent-runtime@${{ env.RUNTIME_REVISION }}"
+          "git+https://github.com/augusto-scarvalho/tare.tools.specgraph@${{ env.SPECGRAPH_REVISION }}"
+          -e ".[dev,attachments,live-cache]"
+
+      - name: Install bubblewrap from the distribution
+        run: sudo apt-get update -q && sudo apt-get install -y -q bubblewrap
+
+      - name: Record the stock host (never fails)
+        run: |
+          . /etc/os-release && echo "distribution: $PRETTY_NAME, kernel $(uname -r)"
+          bwrap --version
+          echo "kernel.apparmor_restrict_unprivileged_userns: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo absent)"
+          grep -H . /proc/sys/kernel/apparmor_restrict_unprivileged* /proc/sys/kernel/unprivileged_userns_clone /proc/sys/user/max_user_namespaces 2>/dev/null || true
+          if bwrap --unshare-user --unshare-net --ro-bind / / true; then echo "plain bwrap --unshare-user: works"; else echo "plain bwrap --unshare-user: refused (exit $?)"; fi
+          python -c "
+          from compute_plane.linux_bwrap import require_support
+          try:
+              require_support()
+              print('require_support: the sandbox is available')
+          except OSError as error:
+              print('require_support:', error)"
+
+      - name: On a stock host that refuses user namespaces, the support check says so
+        id: stock
+        run: python -m pytest tests/test_linux_bwrap.py -q -rs -k stock_host
+
+      # The steps below still run when only the stock check failed, so one run shows both results.
+      - name: Lower the AppArmor restriction on this throwaway runner
+        if: success() || steps.stock.outcome == 'failure'
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --unshare-user --unshare-net --ro-bind / / true && echo "plain bwrap --unshare-user: works"
+
+      - name: Run the real-sandbox tests (a skip fails)
+        if: success() || steps.stock.outcome == 'failure'
+        env:
+          TARE_REQUIRE_SANDBOX: '1'
+        run: python -m pytest tests/test_linux_bwrap.py -v -rs -k "not stock_host" --junitxml=kernel-linux-sandbox.xml
+
+      - name: Upload test receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-tests-linux-sandbox
+          path: kernel-linux-sandbox.xml
+          if-no-files-found: warn

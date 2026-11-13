@@ -52,7 +52,7 @@ O código implementado está em `compute_plane/`, mais os recibos de produtor em
 | Journal de sessão | `native_journal.py`: JSONL append-only por sessão, usado em replay e recuperação |
 | Workspaces Git | `workspace.py` (worktrees vinculadas com leases exatos), `candidate_git.py` |
 | Processos e terminais | `managed_process.py`, `terminal_sessions.py`, `terminal_pty.py`, `terminal_host.py` |
-| Confinamento opcional no Windows | `windows_mxc.py`, `codex_sandbox.py`, `confined_workspace.py` ([guia](docs/guides/CONFINED_EXECUTION.md)) |
+| Confinamento opcional | Windows: `windows_mxc.py`, `codex_sandbox.py`, `confined_workspace.py`; Linux: `linux_bwrap.py` (bubblewrap) ([guia](docs/guides/CONFINED_EXECUTION.md)) |
 | Recibos de produtor | `assurance_plane/producer_receipts.py`: recibos Ed25519 que vinculam um produtor aos bytes de saída |
 | Contexto | `native_instructions.py`, `project_context_hooks.py` |
 
@@ -64,7 +64,7 @@ Limites, sem rodeios:
   leases, cockpit e TUI ficam no tare.tools.os.
 - Raízes de projeto selecionam diretórios de trabalho; **não são sandbox de comandos**.
   Worktrees vinculadas isolam mudanças Git; os perfis opcionais de confinamento
-  acima existem só no Windows e ficam desligados a menos que um host os injete.
+  acima (Windows, e Linux com bubblewrap) ficam desligados a menos que um host os injete.
 
 ## Instalar e testar
 

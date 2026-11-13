@@ -124,9 +124,65 @@ A signature proves producer identity and bytes, not correctness or permission to
 publish. Execution replay prevention stays with existing durable EffectReceipts;
 settlement and consumption remain owner responsibilities.
 
-This is a controlled Windows profile, not certification for arbitrary third-party
-commands. Windows retains ambient resources granted to restricted application
-packages, common registry reads broaden the compatibility profile, and this
-implementation adds no hard disk quota, VM isolation or Linux/macOS profile.
+These are controlled Windows and Linux profiles, not certification for arbitrary
+third-party commands. Windows retains ambient resources granted to restricted
+application packages, common registry reads broaden the compatibility profile, and
+this implementation adds no hard disk quota, VM isolation or macOS profile.
 Those boundaries must be qualified before a broader deployment. Provider-model
 classification, review calibration and native Codex review are separate ports.
+
+## Linux: bubblewrap
+
+Linux hosts can inject `LinuxBwrapProfile` with an immutable
+`BwrapPolicy(read_only, read_write, denied)` of absolute POSIX paths. It is a
+`process_factory` for the same `run_process` supervisor, which keeps its POSIX
+process group, timeouts, output bound and cleanup; receipts carry backend
+`linux-bwrap`. `require_support()` launches the full profile once and otherwise
+raises `OSError` whose message starts with a code: `bwrap_linux_only`,
+`bwrap_architecture_unsupported` (x86_64 and aarch64 only), `bwrap_missing`,
+`bwrap_prlimit_missing`, `bwrap_too_old` (bubblewrap before 0.8),
+`bwrap_userns_refused` or `bwrap_launch_failed`. `bwrap_userns_refused` means the
+kernel or a security module refuses unprivileged user namespaces, as stock Ubuntu
+24.04 does with `kernel.apparmor_restrict_unprivileged_userns=1`; the message
+lists the user-namespace sysctls the host has. The Kernel only reports the cause
+and changes no system setting. No failure falls back to a weaker sandbox.
+
+Inside, only the policy's paths exist, each at its own path. The host lists the
+system roots (`SYSTEM_ROOTS`: `/usr`, `/bin`, `/sbin`, `/lib*`, `/etc`) in the
+policy itself, so the digest names everything bound. bubblewrap adds a fresh
+`/proc`, a minimal `/dev` and an empty `/tmp`; the root is read-only. Binds go
+shallowest first, so a read-only `.git` inside a writable tree stays read-only;
+absent paths are skipped. Every denied path that exists at launch is masked after
+the binds, wherever its real file shows through a bound path: mode 000 and
+read-only (a tmpfs for a folder, an empty file otherwise), so a read fails with
+EACCES rather than returning an empty file. The sandbox has its own user, PID,
+IPC and network namespaces, no capabilities, no nested user namespaces
+(`--disable-userns`), and dies with its parent. `prlimit` inside sets 1024 tasks
+and no core dumps. A seccomp filter assembled in Python and passed by descriptor
+refuses (EPERM) sockets other than AF_UNIX, AF_INET, AF_INET6 and AF_NETLINK, the
+`io_uring` calls, and syscalls of another architecture: an AF_VSOCK socket reaches
+the host through any network namespace, and on WSL2 it can start Windows programs.
+
+Before each launch the profile compares the real path of every scope and the
+identity (real path, device, inode) of every denied path with what it saw when
+created, and refuses a change (`bwrap_scope_changed`, `bwrap_denied_path_changed`).
+Otherwise a check could replace a missing write scope with a link to the home
+folder, or rename a folder above a masked secret, and the next launch would bind
+or expose it. A terminal on stdio, another cwd or environment, and a program
+outside the scopes are refused. bubblewrap itself runs outside the sandbox, so it
+starts with an empty environment and hands the check exactly the bound one
+(`--clearenv`, `--setenv`): no loader variable can make it load a check's library.
+
+What Linux does not match: there is no memory cap (none is possible without
+privilege or a delegated cgroup); the task cap is 1024 rather than 16 processes,
+because Linux counts threads; loopback is private rather than denied, so a check's
+own servers work while host listeners stay unreachable; `/`, the names of the
+folders above each granted path, the whole of `/etc` and host kernel facts in
+`/proc` are visible; a host process that replaces a masked secret by rename (an
+editor's atomic save) unmasks it for the check running at that moment, and the
+next launch is refused. A host without bubblewrap 0.8 or unprivileged user
+namespaces (stock Ubuntu 24.04, many containers, WSL1) has no sandbox. Measured on
+WSL2 (Ubuntu 24.04, kernel 6.6, bubblewrap 0.9.0); CI's `Linux sandbox
+(bubblewrap)` job runs the same tests on a GitHub-hosted Ubuntu 24.04 runner after
+lowering the AppArmor restriction there. Other kernels, arm64 and older bubblewrap
+are not measured.
