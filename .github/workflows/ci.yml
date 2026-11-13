@@ -78,7 +78,16 @@ jobs:
           if-no-files-found: warn
 
   linux-sandbox:
-    name: Linux sandbox (bubblewrap)
+    name: Linux sandbox (bubblewrap, ${{ matrix.allowance }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # How the runner allows bubblewrap its user namespace while the restriction stays on for every other
+        # program: a profile for bwrap alone that only grants it (what tare tells a user to install), or Ubuntu's
+        # own bwrap-userns-restrict, which newer Ubuntu releases load by default. Lifting the restriction for
+        # every program (sysctl kernel.apparmor_restrict_unprivileged_userns=0) also works (measured 2026-11-13)
+        # and is not what a user should be told to do, so it is not run.
+        allowance: [bwrap-profile, ubuntu-profile]
     # Always a GitHub-hosted runner, never CI_RUNNER_LINUX: it lowers a kernel setting with sudo, which only a
     # throwaway machine may take. It proves compute_plane/linux_bwrap.py on stock Ubuntu.
     runs-on: ubuntu-24.04
@@ -126,13 +135,36 @@ jobs:
         run: python -m pytest tests/test_linux_bwrap.py -q -rs -k stock_host
 
       # The steps below still run when only the stock check failed, so one run shows both results.
-      - name: Lower the AppArmor restriction on this throwaway runner
+      - name: Allow bubblewrap alone, with a profile that only grants it user namespaces
+        if: (success() || steps.stock.outcome == 'failure') && matrix.allowance == 'bwrap-profile'
+        run: |
+          sudo tee /etc/apparmor.d/bwrap >/dev/null <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          profile bwrap /usr/bin/bwrap flags=(unconfined) {
+            userns,
+            include if exists <local/bwrap>
+          }
+          PROFILE
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap
+
+      - name: Allow bubblewrap with Ubuntu's own bwrap-userns-restrict profile
+        if: (success() || steps.stock.outcome == 'failure') && matrix.allowance == 'ubuntu-profile'
+        run: |
+          sudo apt-get install -y -q apparmor-profiles
+          sudo cp /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict
+
+      - name: Record what the allowance changed (never fails)
         if: success() || steps.stock.outcome == 'failure'
         run: |
-          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          fi
-          bwrap --unshare-user --unshare-net --ro-bind / / true && echo "plain bwrap --unshare-user: works"
+          echo "kernel.apparmor_restrict_unprivileged_userns: $(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo absent)"
+          # The restriction lets any program create a user namespace but gives it no capabilities there: that is
+          # what stopped bubblewrap (it could not bring its loopback up). Another program must still be stopped.
+          if unshare -Urn ip link set lo up 2>/dev/null; then echo "another program (unshare -Urn ip link set lo up): allowed"; else echo "another program (unshare -Urn ip link set lo up): still refused"; fi
+          if bwrap --unshare-user --unshare-net --ro-bind / / true; then echo "plain bwrap --unshare-user: works"; else echo "plain bwrap --unshare-user: refused (exit $?)"; fi
+          sudo dmesg | grep 'apparmor="DENIED"' | tail -5 || true
 
       - name: Run the real-sandbox tests (a skip fails)
         if: success() || steps.stock.outcome == 'failure'
@@ -144,6 +176,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-tests-linux-sandbox
+          name: kernel-tests-linux-sandbox-${{ matrix.allowance }}
           path: kernel-linux-sandbox.xml
           if-no-files-found: warn
