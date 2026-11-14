@@ -501,9 +501,25 @@ def decode_agy(rows, hooks, model, *, structured=False):
     # tool hook. It performs no task effect. The complete typed result is still
     # mandatory below; every substantive native tool remains a refusal.
     schema_finish = structured and phases == ['pre', 'post', 'stop']
-    if any(r.get('event') == 'step_update' and r['step_update'].get('tool_info')
-           and not ((final_action or schema_finish) and r['step_update']['tool_info'].get('name') == 'finish') for r in rows):
-        raise ModelFailure('CLI_UNEXPECTED_TOOL')
+    stray = [r['step_update'] for r in rows if r.get('event') == 'step_update' and r['step_update'].get('tool_info')
+             and not ((final_action or schema_finish) and r['step_update']['tool_info'].get('name') == 'finish')]
+    if stray:
+        failure = ModelFailure('CLI_UNEXPECTED_TOOL')
+        # Claude Sonnet 5.5 on AGY 1.5.9 calls catalog actions (verify, search, tare_deliver) as functions, with
+        # the guidance against it in place: 3 of 4 implementer sessions blocked on it (2026-11-14). The agent has
+        # only finish, so AGY answers "unknown tool", no tool hook fires and nothing runs: the call is repaired
+        # once, naming the mistake, like a final action the CLI rejected. Any other native tool stays a refusal.
+        last = {id(s) if s.get('step_index') is None else s['step_index']: s for s in stray}  # each step's final state
+        errors = [s['tool_info'].get('error') if isinstance(s['tool_info'], dict) else None for s in last.values()]
+        if schema_finish and all(s.get('state') == 'ERROR' for s in last.values()) and all(
+                isinstance(e, dict) and 'unknown tool' in str(e.get('message', '')) for e in errors):
+            failure = ModelFailure('CLI_UNEXPECTED_TOOL', retryable=True)
+            names = ', '.join(sorted({str(s['tool_info'].get('name')) for s in last.values()}))
+            failure.final_action_error = ('you called ' + names + ' as functions, which this CLI does not have. '
+                'They are actions for Tare: request them only as items of the actions array')[:300]
+            finished = [r['result'] for r in rows if r.get('event') == 'result' and isinstance(r.get('result'), dict)]
+            failure.usage = finished[0].get('usage') if len(finished) == 1 else None  # the rejected attempt was paid
+        raise failure
     # AGY 1.5.3 validates the final action itself and marks finish ERROR when the model broke the schema, yet still
     # reports SUCCESS with the invalid reply: a reply without its required 'text' blocked a TUI session on
     # 2026-11-09. Earlier versions let the model correct it in the same run. Nothing ran, so the call is retried.
