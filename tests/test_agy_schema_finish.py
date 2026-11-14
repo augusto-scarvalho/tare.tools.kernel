@@ -49,6 +49,32 @@ def test_a_final_action_agy_rejected_is_a_retryable_failure_not_a_blocking_one()
     assert "missing property 'text'" in failure.value.final_action_error
 
 
+@pytest.mark.parametrize('damage', [None, 'ran', 'hooked', 'other_error', 'plain'])
+def test_a_catalog_action_called_as_a_function_is_repaired_only_when_agy_had_no_such_tool(damage):
+    # Claude Sonnet 5.5 on AGY 1.5.9 (2026-11-14): verify and search called as functions; AGY answered "unknown
+    # tool" for each, fired no tool hook and reported SUCCESS with an empty reply. The session blocked.
+    hooks = [{'phase': p, 'model': 'fixture', 'invocation': 0,
+              'termination': 'TERMINAL_CUSTOM_HOOK' if p == 'stop' else None} for p in ('pre', 'post', 'stop')]
+    def step(index, name, state, error=None):
+        info = {'name': name, 'parameters': {}, **({'error': {'type': 'TOOL_ERROR', 'message': error}} if error else {})}
+        return {'event': 'step_update', 'step_update': {'state': state, 'step_index': index, 'step_type': 'tool',
+                                                        'tool_name': name, 'tool_info': info}}
+    unknown = 'unknown tool: "%s" — check spelling'
+    rows = [step(2, 'verify', 'ACTIVE'), step(2, 'verify', 'ERROR', unknown % 'verify'),
+            step(3, 'search', 'ACTIVE'), step(3, 'search', 'ERROR', unknown % 'search'),
+            {'event': 'result', 'result': {'status': 'SUCCESS', 'response': '', 'usage': {'input_tokens': 7}}}]
+    if damage == 'ran': rows[3] = step(3, 'search', 'DONE')
+    if damage == 'hooked': hooks.insert(1, {'phase': 'tool', 'model': 'fixture', 'tool': 'search', 'decision': 'deny'})
+    if damage == 'other_error': rows[3] = step(3, 'search', 'ERROR', 'permission denied')
+    with pytest.raises(ModelFailure) as failure:
+        decode_agy(rows, hooks, 'fixture', structured=damage != 'plain')
+    if damage is None:
+        assert failure.value.code == 'CLI_UNEXPECTED_TOOL' and failure.value.retryable is True
+        assert 'search, verify' in failure.value.final_action_error and failure.value.usage == {'input_tokens': 7}
+    else:
+        assert not failure.value.retryable and not hasattr(failure.value, 'final_action_error')
+
+
 def test_a_final_action_the_cli_rejected_is_repaired_once_naming_the_rejection(tmp_path, monkeypatch):
     # AGY 1.5.3 (2026-11-09): the model omitted 'text', then wrote the key as '"\\"text"'. A plain retry resent the
     # same request; the repair tells the model what was rejected. The response keeps the repair's own usage (the
