@@ -9,6 +9,7 @@ piece, AGY from its own record of that call. Machine and day values become place
 give the same texts. A choice maps an item
 id to None (leave the block out) or a text sent in its place; VendorCliClient applies it and refuses, before
 anything is sent, one its CLI cannot honour. `transport_texts()` shows the protocol texts tare itself sends.
+`claude_models()` reads, through the same recorder, which model id each Claude Code family alias names.
 """
 import json
 import os
@@ -293,12 +294,20 @@ def read(endpoint, executable, *, choices=None, seconds=120):
     return {'cli': 'AGY', 'cli_version': _version(executable), 'note': NOTES[endpoint], 'items': []}
 
 
-def _read_claude(executable, choices, seconds):
-    from .native_cli import claude_invocation, cli_env, cli_request, version_tuple
+def _claude_version(executable):
+    from .native_cli import version_tuple
     version = _version(executable)
     if version_tuple(version) < version_tuple(CLAUDE_GUIDANCE_MINIMUM):
         raise ValueError(f'Claude Code {version} cannot be read; tare reads {CLAUDE_GUIDANCE_MINIMUM} or newer.')
-    bodies = []
+    return version
+
+
+def _record_claude(executable, model, choices, seconds, keep, *, tag):
+    """Start Claude Code with tare's command for `model`, pointed at a recorder on this machine (127.0.0.1) that
+    refuses every request, so nothing reaches the provider and no tokens are spent. Returns (keep(first /v1/messages
+    body), or None when none came; the body tare built; the call's folder, already removed)."""
+    from .native_cli import claude_invocation, cli_env, cli_request
+    kept = []
 
     class Recorder(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -306,7 +315,7 @@ def _read_claude(executable, choices, seconds):
             raw = self.rfile.read(int(self.headers.get('Content-Length') or 0))
             if self.path.split('?')[0].endswith('/v1/messages'):
                 try:
-                    bodies.append(json.loads(raw))
+                    kept.append(keep(json.loads(raw)))  # `keep` decides what of the body survives
                 except ValueError:
                     pass
             reply = b'{"type":"error","error":{"type":"invalid_request_error","message":"tare reading only"}}'
@@ -325,21 +334,48 @@ def _read_claude(executable, choices, seconds):
             root = Path(folder)
             # A call without tools, like heads-up notes and plain answers; on 2.1.322 the blocks Claude Code adds
             # were the same in every request shape tare uses.
-            body = cli_request({'model': 'claude-sonnet-5-5', 'tools': [],
+            body = cli_request({'model': model, 'tools': [],
                                 'messages': [{'role': 'user', 'content': READING_PROMPT}]}, native=True)
             env = cli_env()
             env['ANTHROPIC_BASE_URL'] = f'http://127.0.0.1:{server.server_address[1]}'
             argv, source, _ = claude_invocation(executable, root, body, env, validate('cli://claude', choices),
-                                                tag=True)
+                                                tag=tag)
             run_pipe_process(argv, cwd=root, env=env, timeout=seconds, stdin=source.encode('utf-8'),
-                             max_output=4*1024*1024, on_stdout=lambda chunk: None, completed=lambda: bool(bodies))
-            if not bodies:
-                raise ValueError('Claude Code sent no request to read.')
-            items = claude_items(bodies[0], body, [root])
+                             max_output=4*1024*1024, on_stdout=lambda chunk: None, completed=lambda: bool(kept))
     finally:
         server.shutdown()
         server.server_close()
-    return {'cli': 'Claude Code', 'cli_version': version, 'note': NOTES['cli://claude'], 'items': items}
+    return (kept[0] if kept else None), body, root
+
+
+def _read_claude(executable, choices, seconds):
+    version = _claude_version(executable)
+    recorded, body, root = _record_claude(executable, 'claude-sonnet-5-5', choices, seconds, lambda b: b, tag=True)
+    if recorded is None:
+        raise ValueError('Claude Code sent no request to read.')
+    return {'cli': 'Claude Code', 'cli_version': version, 'note': NOTES['cli://claude'],
+            'items': claude_items(recorded, body, [root])}
+
+
+def claude_models(executable, aliases, *, seconds=60):
+    """Which model id the installed Claude Code resolves each family alias to (`fable` -> `claude-fable-5-2`), with
+    zero tokens: {'cli_version', 'models': {alias: model id or None}}. Each alias is the model of one request to the
+    recorder `read` uses, and only that request's `model` field is read; no other field and no header is kept. None
+    when that alias's start failed, the CLI sent no request, or it sent something that is not `claude-<alias>-<version>` (an alias it does not
+    know comes back unchanged). One CLI start per alias, in turn. ValueError for a CLI too old to be read."""
+    version = _claude_version(executable)
+
+    def model(body):
+        return body.get('model') if isinstance(body, dict) else None
+    models = {}
+    for alias in aliases:
+        try:
+            sent = _record_claude(executable, alias, {}, seconds, model, tag=False)[0]
+        except Exception:  # one alias's failed start (a timeout, a refused launch) is that alias unresolved, not the batch
+            sent = None
+        resolved = isinstance(sent, str) and re.fullmatch(rf'claude-{re.escape(alias)}-\d[\w.-]*', sent)
+        models[alias] = sent if resolved else None
+    return {'cli_version': version, 'models': models}
 
 
 def _read_codex(executable, choices, seconds):
