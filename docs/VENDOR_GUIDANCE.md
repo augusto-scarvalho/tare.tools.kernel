@@ -133,6 +133,29 @@ Codex 0.166.0: `skills_instructions`, `permissions instructions`, `collaboration
 AGY 1.5.7 (real reading): `system:frame`, `request:frame`, `request:ADDITIONAL_METADATA`,
 `request:USER_SETTINGS_CHANGE`, `tool:finish`, `tool:manage_task`.
 
+## Which model a Claude Code alias names
+
+Claude Code has no command that lists its models, but it resolves a family alias (`--model fable`) to the newest
+model of that family the installed CLI knows. `claude_models(executable, aliases, *, seconds=60)` reads that
+resolution with zero tokens and returns `{'cli_version', 'models': {alias: model id or None}}`. The caller passes
+the aliases; the Kernel holds no family list. Tare's OS runs it once per CLI version.
+
+- **How.** Each alias is one start of tare's command for a call without tools (hooks off, no mod), pointed at the
+  recorder of the zero-token reading. The recorder refuses the first request, so nothing reaches Anthropic.
+- **What is kept.** Only the `model` field of that request. The recorder drops the rest of the body, which holds
+  account details, and reads no header but `Content-Length`.
+- **None.** An alias comes back as a model id only when the request names `claude-<alias>-<version>`. Claude Code
+  sends an alias it does not know unchanged (measured: `mythos`, `zzz`), and an exact id as given, so neither
+  counts as resolved. A start that sends no request is None too.
+- **One alias per start.** Tare's command takes one `--model`, so the aliases are read in turn: four took about
+  6 seconds on Windows.
+- **Too old.** A CLI older than 2.1.322 is refused with the same `ValueError` as the reading.
+
+Measured on 2026-11-14 with Claude Code 2.1.325 on Windows: `fable` named `claude-fable-5-2`, `opus`
+`claude-opus-5-5`, `sonnet` `claude-sonnet-5-5` and `haiku` `claude-haiku-5-5`. `Fable`, `opus[1m]` and `default`
+were also sent as ids, but not as `claude-<alias>-…`, so they come back as None: pass the family name as the id
+spells it.
+
 ## How each control works
 
 **Claude Code.** The choices travel as a mod written into the call's temporary folder (`tare-guidance/`) and loaded
@@ -192,9 +215,10 @@ switch and not with it; otherwise the call is refused (`CLI_GUIDANCE_UNSUPPORTED
     python tools/vendor_guidance_capture.py codex <path to codex.exe> ['{"environment_context": null}']
     python tools/vendor_guidance_capture.py real claude <path to claude.exe> claude-haiku-5-5
     python tools/vendor_guidance_capture.py real agy <path to agy.exe> gemini-3.8-flash-low
+    python tools/vendor_guidance_capture.py models <path to claude.exe> fable opus sonnet haiku
 
-The first two spend no tokens; `real` makes one small real call. The command prints each item's id, controls,
-SHA-256 and text, and writes nothing. With choices, the CLI is read with them applied, to see that they take.
+The first two and `models` spend no tokens; `real` makes one small real call. The command prints each item's id,
+controls, SHA-256 and text (`models`: each alias and its model id), and writes nothing. With choices, the CLI is read with them applied, to see that they take.
 When a release changes how hooks or switches work, update `CLAUDE_GUIDANCE_MINIMUM` or `CODEX_SWITCHES`.
 
 ## Limits
@@ -210,4 +234,6 @@ When a release changes how hooks or switches work, update `CLAUDE_GUIDANCE_MINIM
 - AGY is read only from its own record of a real call, by the marks in its text; a release that changes those marks
   cannot be read until tare learns them. What AGY sends that its record leaves out cannot be seen, and nothing can
   be changed.
+- An alias's model id says only that the installed Claude Code names it; whether the account may use that model
+  is not checked. The alias reading was measured only with Claude Code 2.1.325 on Windows.
 - What a provider adds on its own servers is invisible to all of this.

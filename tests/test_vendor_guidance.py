@@ -213,9 +213,43 @@ def test_reading_claude_runs_tares_command_against_a_local_recorder_and_stops_at
 
 def test_an_old_claude_cannot_be_read(tmp_path, monkeypatch):
     monkeypatch.setattr(vendor_guidance, 'run_pipe_process', lambda argv, **o: (PHYSICAL, b'2.1.321', b''))
-    with pytest.raises(ValueError, match='2.1.322'):
+    with pytest.raises(ValueError, match='2.1.322') as guidance:
         vendor_guidance.read('cli://claude', str(tmp_path/'claude.exe'))
+    with pytest.raises(ValueError) as models:  # the alias reading refuses it the same way
+        vendor_guidance.claude_models(str(tmp_path/'claude.exe'), ['fable'])
+    assert str(models.value) == str(guidance.value)
     assert normalized('cc_version=2.1.321.b46;') == 'cc_version=<CLI version>;'
+
+
+def test_claude_models_keeps_only_the_model_each_alias_sends_and_none_unless_it_resolved(
+        tmp_path, monkeypatch, capsys):
+    import urllib.error
+    import urllib.request
+    # As measured on 2.1.325: a known alias is sent as its id, an unknown one unchanged. `opus` here comes back as
+    # another family's id and `silent` sends nothing: neither is a model of that alias.
+    sends = {'fable': 'claude-fable-5-2', 'mythos': 'mythos', 'opus': 'claude-sonnet-5-5'}
+    starts = []
+
+    def process(argv, **options):
+        if argv[-1] == '--version':
+            return PHYSICAL, b'2.1.325 (Claude Code)', b''
+        alias = argv[argv.index('--model') + 1]
+        starts.append(alias)
+        assert '--plugin-dir' not in argv and 'disableAllHooks' in argv[argv.index('--settings') + 1]
+        if alias in sends:
+            body = {**recorded_claude(options['cwd']), 'model': sends[alias]}  # holds the account email
+            request = urllib.request.Request(options['env']['ANTHROPIC_BASE_URL'] + '/v1/messages?beta=true',
+                                             data=json.dumps(body).encode(),
+                                             headers={'Authorization': 'Bearer not-kept'}, method='POST')
+            with pytest.raises(urllib.error.HTTPError) as refused:
+                urllib.request.urlopen(request, timeout=10)
+            assert refused.value.code == 400 and options['completed']() is True
+        return PHYSICAL, b'', b''
+    monkeypatch.setattr(vendor_guidance, 'run_pipe_process', process)
+    value = vendor_guidance.claude_models(str(tmp_path/'claude.exe'), ['fable', 'mythos', 'opus', 'silent'])
+    assert value == {'cli_version': '2.1.325',
+                     'models': {'fable': 'claude-fable-5-2', 'mythos': None, 'opus': None, 'silent': None}}
+    assert starts == ['fable', 'mythos', 'opus', 'silent'] and capsys.readouterr() == ('', '')
 
 
 def test_transport_texts_are_what_the_codecs_build():
