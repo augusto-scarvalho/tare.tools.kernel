@@ -361,7 +361,7 @@ def claude_models(executable, aliases, *, seconds=60):
     """Which model id the installed Claude Code resolves each family alias to (`fable` -> `claude-fable-5-2`), with
     zero tokens: {'cli_version', 'models': {alias: model id or None}}. Each alias is the model of one request to the
     recorder `read` uses, and only that request's `model` field is read; no other field and no header is kept. None
-    when the CLI sent no request, or sent something that is not `claude-<alias>-<version>` (an alias it does not
+    when that alias's start failed, the CLI sent no request, or it sent something that is not `claude-<alias>-<version>` (an alias it does not
     know comes back unchanged). One CLI start per alias, in turn. ValueError for a CLI too old to be read."""
     version = _claude_version(executable)
 
@@ -369,7 +369,10 @@ def claude_models(executable, aliases, *, seconds=60):
         return body.get('model') if isinstance(body, dict) else None
     models = {}
     for alias in aliases:
-        sent = _record_claude(executable, alias, {}, seconds, model, tag=False)[0]
+        try:
+            sent = _record_claude(executable, alias, {}, seconds, model, tag=False)[0]
+        except Exception:  # one alias's failed start (a timeout, a refused launch) is that alias unresolved, not the batch
+            sent = None
         resolved = isinstance(sent, str) and re.fullmatch(rf'claude-{re.escape(alias)}-\d[\w.-]*', sent)
         models[alias] = sent if resolved else None
     return {'cli_version': version, 'models': models}

@@ -202,7 +202,7 @@ def test_reading_claude_runs_tares_command_against_a_local_recorder_and_stops_at
                                          data=json.dumps(recorded_claude(root)).encode(),
                                          headers={'Authorization': 'Bearer not-kept'}, method='POST')
         with pytest.raises(urllib.error.HTTPError) as refused:
-            urllib.request.urlopen(request, timeout=10)
+            urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=10)  # never a host proxy
         assert refused.value.code == 400 and options['completed']() is True
         return PHYSICAL | {'protocol_complete': True}, b'', b''
     monkeypatch.setattr(vendor_guidance, 'run_pipe_process', process)
@@ -235,6 +235,8 @@ def test_claude_models_keeps_only_the_model_each_alias_sends_and_none_unless_it_
             return PHYSICAL, b'2.1.325 (Claude Code)', b''
         alias = argv[argv.index('--model') + 1]
         starts.append(alias)
+        if alias == 'broken':
+            raise OSError('this start failed')  # that alias is unresolved; the next one is still read
         assert '--plugin-dir' not in argv and 'disableAllHooks' in argv[argv.index('--settings') + 1]
         if alias in sends:
             body = {**recorded_claude(options['cwd']), 'model': sends[alias]}  # holds the account email
@@ -242,14 +244,14 @@ def test_claude_models_keeps_only_the_model_each_alias_sends_and_none_unless_it_
                                              data=json.dumps(body).encode(),
                                              headers={'Authorization': 'Bearer not-kept'}, method='POST')
             with pytest.raises(urllib.error.HTTPError) as refused:
-                urllib.request.urlopen(request, timeout=10)
+                urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=10)  # never a host proxy
             assert refused.value.code == 400 and options['completed']() is True
         return PHYSICAL, b'', b''
     monkeypatch.setattr(vendor_guidance, 'run_pipe_process', process)
-    value = vendor_guidance.claude_models(str(tmp_path/'claude.exe'), ['fable', 'mythos', 'opus', 'silent'])
-    assert value == {'cli_version': '2.1.325',
-                     'models': {'fable': 'claude-fable-5-2', 'mythos': None, 'opus': None, 'silent': None}}
-    assert starts == ['fable', 'mythos', 'opus', 'silent'] and capsys.readouterr() == ('', '')
+    value = vendor_guidance.claude_models(str(tmp_path/'claude.exe'), ['broken', 'fable', 'mythos', 'opus', 'silent'])
+    assert value == {'cli_version': '2.1.325', 'models': {
+        'broken': None, 'fable': 'claude-fable-5-2', 'mythos': None, 'opus': None, 'silent': None}}
+    assert starts == ['broken', 'fable', 'mythos', 'opus', 'silent'] and capsys.readouterr() == ('', '')
 
 
 def test_transport_texts_are_what_the_codecs_build():
@@ -402,7 +404,7 @@ def test_a_real_claude_reading_records_each_piece_and_says_which_the_local_readi
             request = urllib.request.Request(options['env']['ANTHROPIC_BASE_URL'] + '/v1/messages',
                                              data=json.dumps(recorded_claude(root)).encode(), method='POST')
             with pytest.raises(urllib.error.HTTPError):
-                urllib.request.urlopen(request, timeout=10)
+                urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=10)  # never a host proxy
             return PHYSICAL | {'protocol_complete': True}, b'', b''
         real.append(argv)  # the real call: tare's mod records every piece as sent, one file each
         assert 'const recording: boolean = true;' in source and 'const reading: boolean = false;' in source
