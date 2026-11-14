@@ -21,3 +21,15 @@ def test_agy_batch_guidance_is_a_suffix_without_rewriting_cached_records():
     assert body['response_schema']['properties']['actions']['maxItems']==4
     assert 'at most 4 independent actions' not in body['system']
     assert json.loads(body['prompt'])['conversation_records']==records
+
+
+def test_sonnet_on_agy_is_told_which_names_are_not_functions_and_no_other_route_is():
+    # 2026-11-14, six real implementer sessions each: 8 of 26 calls repaired without this text, 0 of 30 with it.
+    tools=[{'type':'function','function':{'name':name,'parameters':{'type':'object'}}} for name in ('read','tare_deliver')]
+    def reminder(model,**options):
+        return native_cli.cli_request({'model':model,'messages':[],'tools':tools},structured=True,**options).get('reminder','')
+    told=reminder('claude-sonnet-5-5-high')
+    assert 'read, tare_deliver are not functions' in told and told.endswith('"{\\"summary\\":\\"The actual answer.\\"}"}]}.')
+    assert 'finish is the only function' not in reminder('claude-opus-5-5-high')
+    assert 'finish is the only function' not in reminder('gemini-4-hydrogen-high')
+    assert 'finish is the only function' not in reminder('claude-sonnet-5-5',formatter=True)  # Claude Code's own path

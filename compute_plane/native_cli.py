@@ -89,6 +89,15 @@ AGY_ACTION_GUIDANCE = (
     'that object. Tare will execute the requested actions after this CLI returns.'
 )
 
+# Claude Sonnet 5.5 on AGY 1.5.9 called catalog actions as functions in 8 of 26 calls of six real implementer
+# sessions with the guidance above in place (2026-11-14); each one is repaired at the price of one more call.
+AGY_SONNET_GUIDANCE = (
+    'finish is the only function this CLI has. NAMES are not functions: calling one of them here fails with '
+    '"unknown tool" and the decision is lost. Request them only as items of the actions array of the response '
+    'object, the final one too: {"text":"","actions":[{"name":"tare_deliver","arguments_json":'
+    '"{\\"summary\\":\\"The actual answer.\\"}"}]}.'
+)
+
 # Conservative submitted-envelope boundary, not Gemini's native context window.
 # AGY 1.4.12 preserved a 176 KB diagnostic; a 338 KB ordinary audit reported
 # user-request truncation. The exact vendor cap is unmeasured. Never trim input.
@@ -304,6 +313,8 @@ def cli_request(chat, *, structured=False, formatter=False, summary=False, nativ
             # AGY's toolless formatter needs the same explicit host/CLI boundary.
             # Keep its existing system and quoted conversation cache prefix intact.
             body['reminder'] = body.get('reminder', '') + '\n\n' + AGY_ACTION_GUIDANCE
+        if actions and not formatter and not native_arguments and chat['model'].startswith('claude-sonnet'):
+            body['reminder'] = body.get('reminder', '') + '\n\n' + AGY_SONNET_GUIDANCE.replace('NAMES', names)
         if forced is not None:
             body['reminder'] = body.get('reminder', '') + (
                 '\n\nCURRENT EXECUTOR REQUIREMENT, not quoted history: return exactly one external action named '
