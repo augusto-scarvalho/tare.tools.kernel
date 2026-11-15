@@ -182,13 +182,18 @@ class _Silence:
 
     def __init__(self, seconds, clock=time.monotonic, errors=(), quiet=False):
         self.seconds, self.clock, self.errors, self.quiet = seconds, clock, errors, quiet
-        self.last, self.idle_ms, self.failing = clock(), 0, False
+        self.last, self.idle_ms, self.failing, self.tail = clock(), 0, False, b''
 
     def feed(self, chunk):
-        if any(mark in chunk for mark in self.errors):
-            self.failing = True
-        else:
+        if not self.errors:  # any byte is life
             self.last = self.clock()
+            return
+        *rows, self.tail = (self.tail + chunk).split(b'\n')  # whole rows only: a read may split one
+        for row in rows:
+            if any(mark in row for mark in self.errors):
+                self.failing = True
+            elif row.strip():
+                self.last = self.clock()
 
     def __call__(self, sample):
         if self.quiet and not self.failing:

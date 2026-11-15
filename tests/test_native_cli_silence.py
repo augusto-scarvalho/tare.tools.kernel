@@ -12,6 +12,7 @@ from tests.test_native_cli import structured_claude_rows
 from tests.test_native_models import AnyQualified, execution
 
 PHYSICAL = dict(started=True, cleanup_verified=True, exit_code=0, cancelled=False, timeout=False, output_limit=False)
+NL = bytes([10])
 FINAL = ''.join(json.dumps(row) + '\n' for row in structured_claude_rows())
 
 
@@ -81,10 +82,12 @@ def test_a_clis_report_of_its_own_failed_attempt_is_not_life():
     now = [0.0]
     silence = native_cli._Silence(10, clock=lambda: now[0], errors=native_cli.ERROR_REPORTS['cli://codex'])
     now[0] = 5
-    silence.feed(b'{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"..."}}')
+    silence.feed(b'{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"..."}}' + NL)
     now[0] = 9
-    silence.feed(b'{"type":"error","message":"Reconnecting... 1/5"}')
-    silence.feed(b'{"type":"item.completed","item":{"id":"item_2","type":"error","message":"..."}}')
+    silence.feed(b'{"type":"error","message":"Reconnecting... 1/5"}' + NL)
+    silence.feed(b'{"type":"item.completed","item":{"id":"item_2","type":"error","message":"..."}}' + NL)
+    silence.feed(b'{"type":"error","mess')  # a read may split a row: its second half is not life
+    silence.feed(b'age":"Reconnecting... 2/5"}' + NL)
     now[0] = 14.9
     assert silence({}) is False
     now[0] = 15
@@ -97,13 +100,13 @@ def test_a_quiet_cli_is_judged_only_from_its_first_failed_attempt():
     silence = native_cli._Silence(10, clock=lambda: now[0], errors=native_cli.ERROR_REPORTS['cli://agy'], quiet=True)
     now[0] = 500
     assert silence({}) is False  # working in silence for any time
-    silence.feed(b'{"event":"step_update","step_update":{"step_index":2,"state":"DONE","step_type":"error_message"}}')
+    silence.feed(b'{"event":"step_update","step_update":{"step_index":2,"state":"DONE","step_type":"error_message"}}' + NL)
     now[0] = 509
-    silence.feed(b'{"event":"step_update","step_update":{"step_index":3,"state":"DONE","step_type":"error_message"}}')
+    silence.feed(b'{"event":"step_update","step_update":{"step_index":3,"state":"DONE","step_type":"error_message"}}' + NL)
     assert silence({}) is False
     now[0] = 510
     assert silence({}) is True
-    silence.feed(b'{"event":"step_update","step_update":{"step_index":4,"state":"DONE","step_type":"agent_response"}}')
+    silence.feed(b'{"event":"step_update","step_update":{"step_index":4,"state":"DONE","step_type":"agent_response"}}' + NL)
     assert silence({}) is False
 
 
