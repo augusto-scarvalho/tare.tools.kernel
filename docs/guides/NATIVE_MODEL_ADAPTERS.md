@@ -894,7 +894,7 @@ without serializing infinity into JSON. HTTP receipts include the selected waits
 local cleanup never claims a confirmed remote stop. Text and streaming share this
 transport. No extra HTTP attempt or parser of textual tool calls was introduced.
 
-## CLI calls judged by silence (0.9.94)
+## CLI calls judged by silence (0.9.94, 0.9.95)
 
 `VendorCliClient(..., silence_seconds=N)` judges a CLI call by its stdout instead of a total clock. With
 `timeout_seconds=None` the call has no total bound of its own (the enclosing `ExecutionControl` deadline still
@@ -902,9 +902,15 @@ applies); with no window, `None` still means 120 s. A call whose stdout carried 
 stopped through the usual kill and cleanup verification and fails as `NativeTransportInterrupted('CLI_SILENT_EXCHANGE')`;
 its receipt carries `stalled`, `stopped_by_observer`, `idle_ms` (the stdout silence) and `silence_seconds`. The
 tree's CPU time is not consulted: a hung Claude Code still ticks it (measured 2026-11-15, 703 ms in 58 s).
-Only Claude Code takes the window. Codex and AGY print nothing until the reply is whole (92 s of a 95 s call and
-376 s of a 381 s call), so their silence says nothing, the window is ignored and they keep a finite total bound
-(and AGY's `--print-timeout`). HTTP needs nothing: `read_timeout_seconds` with `timeout_seconds=None` is already a
+Every vendor CLI takes the window. Codex is asked for its reasoning summaries (`model_reasoning_summary`), which
+put a row on stdout every 10 to 21 s while the model works; without them it printed nothing for 92 s of a 95 s
+call. AGY's stdout stays silent while the model works (150 s of a 158 s call), so its clock starts only at its
+first failed attempt, and without a total it gets `--print-timeout 0s`. With the connection frozen mid-call,
+Codex and AGY each give up after 5 silent minutes of their own, retry, and report every failed attempt on stdout
+(Codex: `error` rows; AGY: `error_message` steps). Those rows are not life (`ERROR_REPORTS`): a frozen Codex call is
+stopped `N` seconds after its last real row, a frozen AGY call `N` seconds after its first failed attempt unless a
+retry answers. An AGY process that hangs without reporting anything is stopped only by the enclosing deadline or
+cancellation. HTTP needs nothing: `read_timeout_seconds` with `timeout_seconds=None` is already a
 silence bound for a streaming response (each received chunk restarts the socket wait).
 
 ## OpenRouter session affinity and cache accounting

@@ -97,7 +97,9 @@ BEFORE = {'agy': '3dae06ce2c95d5ac02456be7a0c4abefa84e47d1449b5db86cef907e76922d
           'claude-structured': '9acec21e03908e2c9d814362b06a713fd3e7ebff206ecfb03e26a5a1c2876a72',
           'claude-summary': '53a9f9aa1de77632d6254fe197b02cc5cde28ad70276408ab50198b81192c8b6',
           'claude-toolless': '12ae6937dcbd2944854853e78f64c82e21699d5afac8cf935c506b2932680c4c',
-          'codex': '323f3b96baafd112f360d8b66071850e5d262c35d18ac8c9ef0b520eb755afb3'}
+          # 0.9.95: plus `-c model_reasoning_summary="auto"`, which changes the rows Codex prints while the model
+          # works, not what the model receives (before: 323f3b96...).
+          'codex': '1d2f3a09cb06e387488346f3a88f8804db6ba27e20a3a02ed76e7ed17b35464c'}
 
 
 @pytest.mark.parametrize('codec', sorted(CODECS))

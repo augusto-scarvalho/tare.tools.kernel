@@ -12,6 +12,7 @@ from tests.test_native_cli import structured_claude_rows
 from tests.test_native_models import AnyQualified, execution
 
 PHYSICAL = dict(started=True, cleanup_verified=True, exit_code=0, cancelled=False, timeout=False, output_limit=False)
+NL = bytes([10])
 FINAL = ''.join(json.dumps(row) + '\n' for row in structured_claude_rows())
 
 
@@ -70,10 +71,58 @@ def test_the_silence_window_is_measured_from_the_last_byte_not_from_the_start():
 
 
 @pytest.mark.parametrize('endpoint', ['cli://codex', 'cli://agy'])
-def test_a_cli_that_prints_only_when_the_reply_is_whole_keeps_its_total_bound(tmp_path, endpoint):
+def test_codex_and_agy_take_the_window_too(tmp_path, endpoint):
     c = native_cli.VendorCliClient(endpoint, executable=str(tmp_path/'x.exe'), version='1.2.7',
                                    silence_seconds=600, timeout_seconds=None, model_catalog={'slug': 'x'} if 'codex' in endpoint else None)
-    assert c.silence_seconds is None and c.timeout_seconds == 120
+    assert c.silence_seconds == 600 and math.isinf(c.timeout_seconds)
+
+
+def test_a_clis_report_of_its_own_failed_attempt_is_not_life():
+    # Codex, connection frozen: it keeps printing "Reconnecting..." rows that must not restart the window.
+    now = [0.0]
+    silence = native_cli._Silence(10, clock=lambda: now[0], errors=native_cli.ERROR_REPORTS['cli://codex'])
+    now[0] = 5
+    silence.feed(b'{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"..."}}' + NL)
+    now[0] = 9
+    silence.feed(b'{"type":"error","message":"Reconnecting... 1/5"}' + NL)
+    silence.feed(b'{"type":"item.completed","item":{"id":"item_2","type":"error","message":"..."}}' + NL)
+    silence.feed(b'{"type":"error","mess')  # a read may split a row: its second half is not life
+    silence.feed(b'age":"Reconnecting... 2/5"}' + NL)
+    now[0] = 14.9
+    assert silence({}) is False
+    now[0] = 15
+    assert silence({}) is True and silence.idle_ms == 10000
+
+
+def test_a_quiet_cli_is_judged_only_from_its_first_failed_attempt():
+    # AGY says nothing while the model works; its own failed attempts start the clock, a later real row restarts it.
+    now = [0.0]
+    silence = native_cli._Silence(10, clock=lambda: now[0], errors=native_cli.ERROR_REPORTS['cli://agy'], quiet=True)
+    now[0] = 500
+    assert silence({}) is False  # working in silence for any time
+    silence.feed(b'{"event":"step_update","step_update":{"step_index":2,"state":"DONE","step_type":"error_message"}}' + NL)
+    now[0] = 509
+    silence.feed(b'{"event":"step_update","step_update":{"step_index":3,"state":"DONE","step_type":"error_message"}}' + NL)
+    assert silence({}) is False
+    now[0] = 510
+    assert silence({}) is True
+    silence.feed(b'{"event":"step_update","step_update":{"step_index":4,"state":"DONE","step_type":"agent_response"}}' + NL)
+    assert silence({}) is False
+
+
+def test_agy_without_a_total_waits_until_its_turn_completes(tmp_path):
+    body = {'system': 's', 'prompt': 'p', 'model': 'm', 'effort': 'high'}
+    argv, _ = native_cli.agy_invocation('agy', tmp_path/'a', body, math.inf)
+    assert argv[argv.index('--print-timeout')+1] == '0s'
+    argv, _ = native_cli.agy_invocation('agy', tmp_path/'b', body, 30.2)
+    assert argv[argv.index('--print-timeout')+1] == '31s'
+
+
+def test_codex_is_asked_for_the_reasoning_rows_that_show_it_working(tmp_path):
+    from compute_plane.native_cli_codex import REQUIRED_FEATURES, prepare
+    args = prepare(tmp_path, {'model': 'fixture', 'system': 's', 'effort': 'high'}, {'slug': 'fixture'},
+                   features=tuple(REQUIRED_FEATURES))
+    assert 'model_reasoning_summary="auto"' in args
 
 
 def test_without_a_window_the_bound_is_what_it_was(tmp_path):
