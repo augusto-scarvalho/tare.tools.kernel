@@ -186,3 +186,21 @@ WSL2 (Ubuntu 24.04, kernel 6.6, bubblewrap 0.9.0); CI's `Linux sandbox
 (bubblewrap)` job runs the same tests on a GitHub-hosted Ubuntu 24.04 runner after
 lowering the AppArmor restriction there. Other kernels, arm64 and older bubblewrap
 are not measured.
+
+## Unsandboxed POSIX children: owner stamp
+
+Without a `process_factory`, `run_process`, `run_pipe_process` and the audit
+driver start their child through `owned_popen`. On POSIX its environment gets
+`TARE_OWNER=<pid>:<start time>`, naming the process that started it (Linux:
+field 22 of `/proc/<pid>/stat`), and every descendant inherits it. On Linux a
+fresh interpreter (`owned_exec.py`, so the threaded host runs no `preexec_fn`)
+sets `PR_SET_PDEATHSIG` to SIGKILL, checks that its parent is still the one
+that started it, and execs the command with the environment the parent passed
+and SIGPIPE and SIGXFSZ at default. A tare killed with SIGKILL thus takes its
+direct child with it; the signal fires when the starting thread ends, which is
+why only callers that wait in that thread use it (terminal sessions do not).
+A grandchild survives a killed tare, since nothing is left to kill the process
+group; `owner_alive(stamp)` lets a host find it later: `False`
+only when the pid is gone, a zombie, or reused by a process that started at
+another time; `None` when the stamp is malformed or `/proc` cannot be read.
+Windows needs neither: the Job Object kills the tree when tare's handle closes.

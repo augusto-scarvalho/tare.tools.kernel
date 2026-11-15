@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -43,6 +44,69 @@ def host_executable(name, *, required=False):
     if required:
         raise FileNotFoundError('Native host executable not available on absolute PATH: '+name)
     return None
+
+
+def _proc_stat(pid):
+    """Fields of Linux /proc/<pid>/stat after the command name: [0] is field 3 (state), [19] field 22 (start time)."""
+    return Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+
+
+def owner_stamp():
+    """TARE_OWNER value naming this process: '<pid>:<start time>', the start time empty where it cannot be read back."""
+    try:
+        start = _proc_stat(os.getpid())[19]
+    except (OSError, IndexError):
+        start = ''
+    return f'{os.getpid()}:{start}'
+
+
+def owner_alive(stamp):
+    """True if the stamp's process runs, False if it provably does not, None if that cannot be told.
+
+    False only for a pid that is gone, a zombie, or reused by a process that started at another time.
+    """
+    match = re.fullmatch(r'([1-9][0-9]*):(0|[1-9][0-9]*)', stamp) if isinstance(stamp, str) else None
+    if match is None:
+        return None
+    try:
+        _proc_stat(os.getpid())
+    except (OSError, IndexError):
+        return None  # No readable /proc here: nothing can be proved.
+    try:
+        fields = _proc_stat(int(match[1]))
+        return fields[0] not in ('Z', 'X') and fields[19] == match[2]
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    except (OSError, IndexError):
+        return None
+
+
+def owned_popen(argv, *, env=None, **options):
+    """Popen for an unsandboxed child: on POSIX stamped with TARE_OWNER, on Linux also killed when tare dies.
+
+    PR_SET_PDEATHSIG fires when the spawning thread ends, so a caller waits for the child in that thread.
+    The exec shim keeps preexec_fn out of the threaded host; a command that cannot start still raises
+    OSError here, as Popen would.
+    """
+    if os.name == 'nt':
+        return subprocess.Popen(argv, env=env, **options)
+    env = dict(os.environ if env is None else env, TARE_OWNER=owner_stamp())
+    if not sys.platform.startswith('linux'):
+        return subprocess.Popen(argv, env=env, **options)
+    read, write = os.pipe()
+    try:
+        try:
+            proc = subprocess.Popen([sys.executable, '-I', str(Path(__file__).with_name('owned_exec.py')),
+                                     str(write), str(os.getpid()), *argv], env=env, pass_fds=(write,), **options)
+        finally:
+            os.close(write)
+        error = os.read(read, 16)  # End of file once the shim's exec succeeded.
+    finally:
+        os.close(read)
+    if error:
+        proc.wait()
+        raise OSError(int(error), os.strerror(int(error)), argv[0])
+    return proc
 
 
 def terminate_process_tree(process: subprocess.Popen[str]) -> None:
@@ -325,7 +389,7 @@ def run_process(argv, *, cwd, dest, timeout, env=None, stdin=b'', cancelled=lamb
             if resource_limits is not None:
                 result['resource_limits'] = list(resource_limits)
         with (dest / 'stdin.txt').open('rb') as inp, (dest / 'stdout.txt').open('wb') as out, (dest / 'stderr.txt').open('wb') as err:
-            factory = process_factory if process_factory is not None else subprocess.Popen
+            factory = process_factory if process_factory is not None else owned_popen
             proc = factory(argv, cwd=cwd, env=env, stdin=inp, stdout=out, stderr=err,
                 **({'creationflags': 0x4} if job else {'start_new_session': True}))
             result['pid'] = proc.pid
@@ -430,7 +494,7 @@ def run_pipe_process(argv, *, cwd, timeout, stdin=b'', cancelled=lambda: False,
     try:
         if os.name == 'nt':
             job = WindowsJob()
-        proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE,
+        proc = owned_popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             **({'creationflags': 0x4} if job else {'start_new_session': True}))
         result.update(started=True, pid=proc.pid)

@@ -9,7 +9,7 @@ import tempfile
 import time
 from uuid import UUID
 
-from .managed_process import host_executable, terminate_process_tree
+from .managed_process import host_executable, owned_popen, terminate_process_tree
 from .workspace import isolated_child_environment
 
 AUDIT_PACKET_SYSTEM_PROMPT = (
@@ -174,8 +174,8 @@ class ClaudeAuditDriver:
             # Windows pipe when the provider never reads stdin. No writer thread.
             source.write(prompt)
             source.seek(0)
-            child = subprocess.Popen(command, cwd=root, env=env, stdin=source,
-                                     stdout=out, stderr=err, **options)
+            child = owned_popen(command, cwd=root, env=env, stdin=source,
+                                stdout=out, stderr=err, **options)
             deadline = time.monotonic() + timeout
             try:
                 while True:
