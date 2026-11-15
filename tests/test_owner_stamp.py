@@ -60,6 +60,7 @@ def test_stamped_environment_is_exact_and_signals_are_default(tmp_path):
     ignored = int(lines.pop().split()[1], 16)
     assert not ignored & (1 << signal.SIGPIPE - 1 | 1 << signal.SIGXFSZ - 1)
     assert {'LC_CTYPE=C', 'PATH=' + env['PATH'], 'TARE_OWNER=' + owner_stamp()} <= set(lines)
+    assert f"TARE_GROUP={result['pid']}" in lines  # the command leads the group tare kills at its end
 
 
 @linux
@@ -112,6 +113,7 @@ def test_a_killed_owner_takes_its_child_and_leaves_a_stamped_orphan(tmp_path):
         assert running(grandchild)
         environ = Path(f'/proc/{grandchild}/environ').read_bytes().split(b'\0')
         assert ('TARE_OWNER=' + stamp).encode() in environ
+        assert f'TARE_GROUP={child}'.encode() in environ and os.getpgid(grandchild) == child  # still in tare's group
         assert owner_alive(stamp) is False
     finally:
         if parent.poll() is None:

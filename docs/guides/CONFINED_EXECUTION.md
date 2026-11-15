@@ -203,4 +203,8 @@ A grandchild survives a killed tare, since nothing is left to kill the process
 group; `owner_alive(stamp)` lets a host find it later: `False`
 only when the pid is gone, a zombie, or reused by a process that started at
 another time; `None` when the stamp is malformed or `/proc` cannot be read.
+The shim also sets `TARE_GROUP=<pgid>`, the process group tare kills when the
+command ends: a host that ends orphans should end only stamped processes still
+in that group, so a daemon the command detached on purpose (a build daemon other
+programs share) is spared.
 Windows needs neither: the Job Object kills the tree when tare's handle closes.
