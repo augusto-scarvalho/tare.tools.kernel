@@ -98,8 +98,9 @@ def test_a_quiet_cli_is_judged_only_from_its_first_failed_attempt():
     # AGY says nothing while the model works; its own failed attempts start the clock, a later real row restarts it.
     now = [0.0]
     silence = native_cli._Silence(10, clock=lambda: now[0], errors=native_cli.ERROR_REPORTS['cli://agy'], quiet=True)
+    now[0] = 29
+    assert silence({}) is False  # working in silence, inside its ceiling of three windows
     now[0] = 500
-    assert silence({}) is False  # working in silence for any time
     silence.feed(b'{"event":"step_update","step_update":{"step_index":2,"state":"DONE","step_type":"error_message"}}' + NL)
     now[0] = 509
     silence.feed(b'{"event":"step_update","step_update":{"step_index":3,"state":"DONE","step_type":"error_message"}}' + NL)
@@ -108,6 +109,17 @@ def test_a_quiet_cli_is_judged_only_from_its_first_failed_attempt():
     assert silence({}) is True
     silence.feed(b'{"event":"step_update","step_update":{"step_index":4,"state":"DONE","step_type":"agent_response"}}' + NL)
     assert silence({}) is False
+
+
+def test_a_quiet_cli_that_reports_nothing_still_ends():
+    # A version that words its failed attempts differently never starts the short clock: the ceiling ends the call.
+    now = [0.0]
+    silence = native_cli._Silence(10, clock=lambda: now[0], errors=native_cli.ERROR_REPORTS['cli://agy'], quiet=True)
+    silence.feed(b'{"event":"step_update","step_update":{"step_type":"some_new_failure_wording"}}' + NL)
+    now[0] = 29
+    assert silence({}) is False
+    now[0] = 30
+    assert silence({}) is True and silence.idle_ms == 30000
 
 
 def test_agy_without_a_total_waits_until_its_turn_completes(tmp_path):

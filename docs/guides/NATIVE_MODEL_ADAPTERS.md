@@ -894,7 +894,7 @@ without serializing infinity into JSON. HTTP receipts include the selected waits
 local cleanup never claims a confirmed remote stop. Text and streaming share this
 transport. No extra HTTP attempt or parser of textual tool calls was introduced.
 
-## CLI calls judged by silence (0.9.94, 0.9.95)
+## CLI calls judged by silence (0.9.94 to 0.9.96)
 
 `VendorCliClient(..., silence_seconds=N)` judges a CLI call by its stdout instead of a total clock. With
 `timeout_seconds=None` the call has no total bound of its own (the enclosing `ExecutionControl` deadline still
@@ -909,8 +909,10 @@ first failed attempt, and without a total it gets `--print-timeout 0s`. With the
 Codex and AGY each give up after 5 silent minutes of their own, retry, and report every failed attempt on stdout
 (Codex: `error` rows; AGY: `error_message` steps). Those rows are not life (`ERROR_REPORTS`): a frozen Codex call is
 stopped `N` seconds after its last real row, a frozen AGY call `N` seconds after its first failed attempt unless a
-retry answers. An AGY process that hangs without reporting anything is stopped only by the enclosing deadline or
-cancellation. HTTP needs nothing: `read_timeout_seconds` with `timeout_seconds=None` is already a
+retry answers. The reports are recognised by their text as AGY 1.5.9 and Codex 0.166.0 wrote it, so an AGY call
+that has reported nothing still has a ceiling: `QUIET_WINDOWS` (3) times `N` without a word on stdout, which also
+ends an AGY process that hangs without reporting anything. A working AGY call that stays silent for longer than
+that is cut. HTTP needs nothing: `read_timeout_seconds` with `timeout_seconds=None` is already a
 silence bound for a streaming response (each received chunk restarts the socket wait).
 
 ## OpenRouter session affinity and cache accounting

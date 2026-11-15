@@ -171,6 +171,9 @@ PROBE_SECONDS = 60  # a hung probe must leave the real request most of its time
 # are not life: they would keep a dead call inside any window for ever.
 ERROR_REPORTS = {'cli://codex': (b'"type":"error"',),
                  'cli://agy': (b'"step_type":"error_message"', b'"event":"error"')}
+# A quiet CLI that reported no failed attempt still has a ceiling: this many windows without a word. The reports are
+# recognised by their text as AGY 1.5.9 wrote it; a version that words them differently would otherwise wait for ever.
+QUIET_WINDOWS = 3
 
 
 class _Silence:
@@ -178,7 +181,8 @@ class _Silence:
     still ticks it (703 ms in 58 s), so run_pipe_process's own idle_timeout would never trip. Used as `on_stdout`
     (feed) and `on_progress` (about once a second); exactly True stops the tree. The CLI's report of its own failed
     attempt (`errors`) is not life. A `quiet` CLI (AGY) says nothing while it works, so its clock starts at its first
-    such report: from there its retries have `seconds` to end the call."""
+    such report: from there its retries have `seconds` to end the call. Before any report it has QUIET_WINDOWS times
+    that, so a failure it reports in words this code does not know still ends."""
 
     def __init__(self, seconds, clock=time.monotonic, errors=(), quiet=False):
         self.seconds, self.clock, self.errors, self.quiet = seconds, clock, errors, quiet
@@ -191,15 +195,15 @@ class _Silence:
         *rows, self.tail = (self.tail + chunk).split(b'\n')  # whole rows only: a read may split one
         for row in rows:
             if any(mark in row for mark in self.errors):
+                if self.quiet and not self.failing:
+                    self.last = self.clock()  # the first report starts the short clock
                 self.failing = True
             elif row.strip():
                 self.last = self.clock()
 
     def __call__(self, sample):
-        if self.quiet and not self.failing:
-            self.last = self.clock()
         self.idle_ms = (self.clock() - self.last) * 1000
-        return self.idle_ms >= self.seconds * 1000
+        return self.idle_ms >= self.seconds * 1000 * (QUIET_WINDOWS if self.quiet and not self.failing else 1)
 
 
 class _Unqualified(Exception):
