@@ -163,24 +163,36 @@ PROBE_SECONDS = 60  # a hung probe must leave the real request most of its time
 # Measured on 2026-11-15 (real calls, tare's own commands, stdout bytes sampled each second): Claude Code's stdout never
 # stayed silent more than 1.5 s in a 102 s call (a heartbeat row about every 1.2 s while the model works), and in 60 s
 # with its API connection accepted but never answered it wrote nothing for 58 s while its CPU time still grew 703 ms.
-# Codex printed nothing for 92 s of a 95 s call and AGY for 376 s of a 381 s call: they show no life until the reply
-# is whole, so their silence says nothing and a silence window would only be a guess. They keep the total bound.
-SILENT_BY_DESIGN = frozenset({'cli://codex', 'cli://agy'})
+# Codex printed nothing for 92 s of a 95 s call until its reasoning summaries were turned on (native_cli_codex.prepare):
+# then a reasoning row came every 10 to 21 s of a 119 s call. AGY's stdout stays silent while the model works (150 s of
+# a 158 s call), so it cannot be judged by silence. With the connection frozen mid-call (a loopback proxy that stops
+# forwarding), each CLI gives up on its own after 5 silent minutes and retries, and reports every failed attempt on
+# stdout: Codex as `error` rows, AGY as `error_message` steps (one about every 70 s, at least six times). Those rows
+# are not life: they would keep a dead call inside any window for ever.
+ERROR_REPORTS = {'cli://codex': (b'"type":"error"',),
+                 'cli://agy': (b'"step_type":"error_message"', b'"event":"error"')}
 
 
 class _Silence:
-    """No byte on stdout for `seconds` ends the call. The tree's CPU time cannot judge it: a hung Claude Code still
-    ticks it (703 ms in 58 s), so run_pipe_process's own idle_timeout would never trip. Used as `on_stdout` (feed) and
-    `on_progress` (about once a second); exactly True stops the tree."""
+    """No sign of life on stdout for `seconds` ends the call. The tree's CPU time cannot judge it: a hung Claude Code
+    still ticks it (703 ms in 58 s), so run_pipe_process's own idle_timeout would never trip. Used as `on_stdout`
+    (feed) and `on_progress` (about once a second); exactly True stops the tree. The CLI's report of its own failed
+    attempt (`errors`) is not life. A `quiet` CLI (AGY) says nothing while it works, so its clock starts at its first
+    such report: from there its retries have `seconds` to end the call."""
 
-    def __init__(self, seconds, clock=time.monotonic):
-        self.seconds, self.clock = seconds, clock
-        self.last, self.idle_ms = clock(), 0
+    def __init__(self, seconds, clock=time.monotonic, errors=(), quiet=False):
+        self.seconds, self.clock, self.errors, self.quiet = seconds, clock, errors, quiet
+        self.last, self.idle_ms, self.failing = clock(), 0, False
 
     def feed(self, chunk):
-        self.last = self.clock()
+        if any(mark in chunk for mark in self.errors):
+            self.failing = True
+        else:
+            self.last = self.clock()
 
     def __call__(self, sample):
+        if self.quiet and not self.failing:
+            self.last = self.clock()
         self.idle_ms = (self.clock() - self.last) * 1000
         return self.idle_ms >= self.seconds * 1000
 
@@ -420,7 +432,8 @@ def agy_invocation(executable, root, body, timeout):
     prepare_agy(root, body['system'])
     argv = [executable, '--add-dir', str(root), '--agent', 'tare-inference',
             '--model', body['model'], '--effort', body['effort'],
-            '--disable-slash-commands', '--print-timeout', str(math.ceil(timeout))+'s',
+            '--disable-slash-commands', '--print-timeout',  # 0s: AGY waits until the turn completes
+            '0s' if math.isinf(timeout) else str(math.ceil(timeout))+'s',
             '--output-format', 'stream-json', '--input-format', 'stream-json']
     if 'response_schema' in body:
         argv += ['--json-schema', encode(body['response_schema'])]
@@ -804,9 +817,7 @@ class VendorCliClient:
         if silence_seconds is not None and (type(silence_seconds) not in (int, float)
                                             or not math.isfinite(silence_seconds) or silence_seconds <= 0):
             raise ValueError('positive finite silence window required')
-        # A silence window judges a call by its stdout instead of a total clock; where stdout says nothing while the
-        # model works (SILENT_BY_DESIGN) it is ignored and the call keeps its total bound.
-        self.silence_seconds = None if endpoint in SILENT_BY_DESIGN else silence_seconds
+        self.silence_seconds = silence_seconds  # judges a call by its stdout (_Silence) instead of a total clock
         if timeout_seconds is None:
             # The workflow can be unlimited; each CLI invocation stays bounded: by its silence, or else by 120 s.
             timeout_seconds = 120 if self.silence_seconds is None else math.inf
@@ -1035,7 +1046,9 @@ class VendorCliClient:
                 try:
                     completion = (AgyCompletion(root, body['model'], 'response_schema' in body)
                                   if self.endpoint == 'cli://agy' else None)
-                    silence = _Silence(self.silence_seconds) if self.silence_seconds is not None else None
+                    silence = (_Silence(self.silence_seconds, errors=ERROR_REPORTS.get(self.endpoint, ()),
+                                        quiet=self.endpoint == 'cli://agy')
+                               if self.silence_seconds is not None else None)
                     feeds = [f.feed for f in (completion, silence) if f is not None]
                     physical, raw, errors = run_pipe_process(argv, cwd=root, env=env,
                         timeout=min(timeout, control.remaining_seconds()), stdin=source.encode('utf-8'),

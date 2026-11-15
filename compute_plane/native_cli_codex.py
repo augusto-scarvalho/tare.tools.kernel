@@ -139,7 +139,10 @@ def prepare(root, body, catalog, *, features, guidance=None):
               'model_reasoning_effort': body['effort'], 'service_tier': 'default', 'web_search': 'disabled',
               'project_doc_max_bytes': 0, 'developer_instructions': '', 'notify': [],
               'tools.update_plan.enabled': False, 'tools.experimental_request_user_input.enabled': False,
-              'suppress_unstable_features_warning': True}
+              'suppress_unstable_features_warning': True,
+              # A reasoning row every 10 to 21 s while the model works (measured); with the catalog's default
+              # ("none") stdout stays silent until the reply is whole and the call cannot be judged by its silence.
+              'model_reasoning_summary': 'auto'}
     from .vendor_guidance import codex_switches
     config.update({key: False for key, _ in codex_switches(guidance or {}).values()})  # the owner's removals
     args = ['exec', '--ignore-user-config', '--ephemeral', '--skip-git-repo-check',
