@@ -289,8 +289,12 @@ class _Activity:
         self.sample(output, now)
         if self.on_progress is not None:
             try:
-                self.on_progress({'elapsed_ms': (now - self.started) * 1000, 'idle_ms': self.result['idle_ms'],
-                                  'cpu_ms': self.result['cpu_ms'], 'output_bytes': output})
+                # A host that asks someone before stopping a silent tree gives no idle_timeout and answers here:
+                # exactly True stops the tree now, as a stall (the tree keeps running while the host decides).
+                if self.on_progress({'elapsed_ms': (now - self.started) * 1000, 'idle_ms': self.result['idle_ms'],
+                                     'cpu_ms': self.result['cpu_ms'], 'output_bytes': output}) is True:
+                    self.result['stopped_by_observer'] = True
+                    return True
             except Exception:
                 self.result['progress_failures'] += 1
         return self.measured and self.idle_timeout is not None and now - self.active_at >= self.idle_timeout

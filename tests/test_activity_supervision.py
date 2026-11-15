@@ -81,6 +81,16 @@ def test_progress_is_sampled_while_it_runs_and_a_failing_observer_breaks_nothing
 
 
 @RUNNERS
+def test_an_observer_that_answers_true_stops_the_tree_and_no_other_answer_does(tmp_path, runner):
+    # A host that asks someone before stopping a silent tree gives no idle limit: the tree runs while it decides.
+    receipt, wall = run(runner, tmp_path, SILENT.format(30), timeout=30, on_progress=lambda sample: sample['idle_ms'] > 1500)
+    assert receipt['stalled'] is True and receipt['stopped_by_observer'] is True and receipt['timeout'] is False
+    assert receipt['cleanup_verified'] and wall < 15
+    receipt, _ = run(runner, tmp_path, SILENT.format(3), timeout=30, on_progress=lambda sample: 'stop')
+    assert receipt['exit_code'] == 0 and receipt['stalled'] is False and 'stopped_by_observer' not in receipt
+
+
+@RUNNERS
 def test_without_a_cpu_measurement_the_idle_limit_stops_nothing(tmp_path, runner, monkeypatch):
     monkeypatch.setattr(managed_process, '_tree_cpu_ms', lambda job, pgid: None)
     receipt, _ = run(runner, tmp_path, SILENT.format(3), timeout=30, idle_timeout=1)
