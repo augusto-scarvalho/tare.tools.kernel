@@ -300,8 +300,14 @@ class NativeCapabilities:
         self._tools.command_mediation = CallbackCommandMediation(self.mediate_command)
 
     def bind_command_confinement(self, process_factory, environment, seconds, *, verification_seconds=None,
-                                 staged_effects=False, unbounded_verification=False):
-        """Host-only installation before command execution; never a model tool."""
+                                 staged_effects=False, unbounded_verification=False, unbounded_command=False,
+                                 idle_seconds=None, verification_idle_seconds=None, on_progress=None):
+        """Host-only installation before command execution; never a model tool.
+
+        `idle_seconds` / `verification_idle_seconds` stop a protected command / verification that showed no output
+        and no CPU work for that long; `unbounded_command` removes the command's own wall ceiling as
+        `unbounded_verification` does for verifications; `on_progress(effect_id, sample)` receives their samples.
+        """
         if (self._started or self._request is not None
                 or getattr(self._tools, 'process_factory', None) is not None
                 or self.terminal is not None):
@@ -311,14 +317,25 @@ class NativeCapabilities:
             raise ValueError('staged_effects_must_be_bool')
         if type(unbounded_verification) is not bool:
             raise ValueError('unbounded_verification_must_be_bool')
+        if type(unbounded_command) is not bool:
+            raise ValueError('unbounded_command_must_be_bool')
+        if on_progress is not None and not callable(on_progress):
+            raise ValueError('on_progress_must_be_callable')
         copied, seconds = validate_command_confinement(process_factory, environment, seconds)
         if verification_seconds is not None:
             _,verification_seconds=validate_command_confinement(process_factory,environment,verification_seconds)
+        idle_seconds, verification_idle_seconds = (
+            None if value is None else validate_command_confinement(process_factory, environment, value)[1]
+            for value in (idle_seconds, verification_idle_seconds))
         self._tools.process_factory = process_factory
         self._tools.command_environment = copied
         self._tools.command_seconds = seconds
         self._tools.verification_seconds = verification_seconds
         self._tools.unbounded_verification = unbounded_verification
+        self._tools.unbounded_command = unbounded_command
+        self._tools.idle_seconds, self._tools.verification_idle_seconds = idle_seconds, verification_idle_seconds
+        if on_progress is not None:
+            self._tools.on_progress = lambda sample: on_progress(getattr(self._request, 'effect_id', None), sample)
         self._staged_effects = staged_effects
 
     def claim_action(self, action, authorization):
@@ -436,7 +453,7 @@ class NativeCapabilities:
                         or len(encode(argv).encode('utf-8')) > 16384):
                     raise ValueError('protected_command_argv_invalid')
                 output = self._tools.command(argv, self._tools.path(args['repository'], '.', directory=True),
-                                             timeout=control.remaining_seconds())
+                                             timeout=control.remaining_seconds(), protected=True)
                 self._tools.reads.clear(); self._tools.verifications.clear()
             elif name == 'context':
                 repository = args['repository']
@@ -516,17 +533,22 @@ class NativeCapabilities:
                     output['detail'] = exc.detail[:600]
             if isinstance(exc, CommandInterrupted):
                 output['process'] = exc.receipt
+                idle = round(exc.receipt['idle_ms'] / 1000) if exc.receipt.get('stalled') is True else None
+                if idle is not None:
+                    output['reason'] = f'The process showed no activity (no output, no CPU time) for {idle} seconds and was stopped.'
                 if request.tool_call.name in {'command','verify'}:
                     self._tools.reads.clear(); self._tools.verifications.clear()
                 if (getattr(self,'_staged_effects',False) and request.tool_call.name in {'command','verify'}
                         and exc.receipt.get('cleanup_verified') is True and not exc.receipt.get('cancelled')
                         and not exc.receipt.get('isolation_violation') and not control.should_stop()
-                        and (exc.receipt.get('output_limit') or exc.receipt.get('timeout'))):
+                        and (exc.receipt.get('output_limit') or exc.receipt.get('timeout') or idle is not None)):
                     # The host confines all writes to a disposable staged area
                     # and denies network. Termination is proved, but staged
                     # changes may be partial: inspect them, never replay here.
                     status='failed'
-                    output.update(reason='Staged command stopped at its output/time bound; partial changes may remain.',
+                    output.update(reason='Staged command stopped at its output/time bound; partial changes may remain.'
+                        if idle is None else f'Staged command showed no activity for {idle} seconds and was stopped; '
+                        'partial changes may remain.',
                         effects_may_be_partial=True,
                         next_action='Inspect the candidate before any correction. Do not replay the command automatically. '
                             'Use bounded output or capture/filter large data; checks and independent review still gate application.')

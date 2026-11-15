@@ -26,7 +26,7 @@ replaying a raw command.
 
 `staged_effects=True` is a host-only recovery contract: the caller must confine
 every write to its disposable candidate/scratch and deny network. A command
-stopped by an output/time bound may then return failed after proved cleanup,
+stopped by an output/time bound or a bound idle limit may then return failed after proved cleanup,
 with possible partial effects and invalidated read/check observations. The
 agent can inspect that staging area; no command is automatically replayed and
 application still belongs to the host's verification/review gate. This is off

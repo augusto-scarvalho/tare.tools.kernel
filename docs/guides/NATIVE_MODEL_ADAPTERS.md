@@ -30,6 +30,18 @@ verification still uses its enclosing operation deadline, process factory,
 mediation and cancellation. The default is false and legacy bindings keep their
 existing limits.
 
+A host may also judge a command or verification by its activity. `idle_seconds`
+and `verification_idle_seconds` stop the protected `command` or a verification
+whose process tree wrote no output and used less than 1% CPU time (Windows job
+accounting, Linux `/proc` of the process group) for that long; the effect then
+says the process showed no activity for N seconds, and its process receipt
+carries `stalled`, `idle_ms` and `cpu_ms` next to `timeout`. `unbounded_command`
+removes the command's own wall ceiling as `unbounded_verification` does for
+verifications. `on_progress(effect_id, sample)` receives `elapsed_ms`, `idle_ms`,
+`cpu_ms` and `output_bytes` about once a second on the waiting thread; an
+exception there is counted, never fatal. Nothing is bound by default, and where
+CPU time is not measured an idle limit stops nothing.
+
 ## Claude summary count estimates
 
 Claude formatter and plain-summary envelopes name their quoted history differently.

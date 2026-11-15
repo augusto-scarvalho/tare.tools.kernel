@@ -103,6 +103,9 @@ class MediatedTools:
         self.command_seconds = command_seconds
         self.verification_seconds = None
         self.unbounded_verification = False
+        # Host-bound supervision of protected commands and verifications (NativeCapabilities.bind_command_confinement).
+        self.unbounded_command = False
+        self.idle_seconds = self.verification_idle_seconds = self.on_progress = None
         grant = {key: config.get(key) for key in ('host', 'role', 'writable', 'admitted_capabilities', 'allow_exec')}
         grant['repositories'] = {name: str(path) for name, path in self.roots.items()}
         self.command_grant_sha256 = hashlib.sha256(json.dumps(grant, sort_keys=True, allow_nan=False).encode()).hexdigest()
@@ -179,7 +182,8 @@ class MediatedTools:
         return hashlib.sha256(target.read_bytes()).hexdigest()
 
     def command(self, argv, root, *, timeout=None, gate=True, read_only=False, output_bytes=16384, partial_read=False,
-                verification=False):
+                verification=False, protected=False):
+        """`protected`: the native `command` capability, which the host's command idle limit and ceiling choice govern."""
         if (type(partial_read) is not bool or partial_read and
                 (read_only is not True or type(output_bytes) is not int or not 1 <= output_bytes <= 1024*1024)):
             raise ValueError('partial_output_requires_read_only_and_bounded_bytes')
@@ -197,10 +201,16 @@ class MediatedTools:
         environment = dict(self.command_environment) if self.command_environment is not None else isolated_child_environment()
         effective_timeout = timeout or self.config.get("operation_timeout", 300)
         command_limit=self.verification_seconds if verification and self.verification_seconds is not None else self.command_seconds
-        if verification and self.unbounded_verification:
+        if self.unbounded_verification if verification else (protected and self.unbounded_command):
             command_limit = None  # host opt-in; operation deadline and cancellation still apply
         if command_limit is not None:
             effective_timeout = min(effective_timeout, command_limit)
+        supervision = {}
+        idle = self.verification_idle_seconds if verification else self.idle_seconds if protected else None
+        if idle is not None:
+            supervision['idle_timeout'] = idle
+        if self.on_progress is not None and (verification or protected):
+            supervision['on_progress'] = self.on_progress
         with tempfile.TemporaryDirectory(prefix="tare-command-",
                 dir=io_path(self.scratch_root) if self.scratch_root is not None else None) as temporary:
             def effect():
@@ -211,7 +221,7 @@ class MediatedTools:
                     extra_kwargs["process_factory"] = self.process_factory
                 return run_process(list(argv), cwd=str(root) if self.process_factory is not None else root, dest=temporary,
                     timeout=effective_timeout,
-                    env=environment, cancelled=self.cancelled, max_output=1024 * 1024, **extra_kwargs)
+                    env=environment, cancelled=self.cancelled, max_output=1024 * 1024, **extra_kwargs, **supervision)
             if self.command_mediation is None:
                 process = effect()
             else:
@@ -222,7 +232,7 @@ class MediatedTools:
                         'read_only': read_only, 'output_bytes': output_bytes}, sort_keys=True, allow_nan=False))
                 process = invoke(self.command_mediation, facts, effect)
             if (not process["cleanup_verified"] or process["cancelled"] or process["timeout"]
-                    or process.get('isolation_violation')):
+                    or process.get('stalled') or process.get('isolation_violation')):
                 raise CommandInterrupted(process)
             if process['output_limit']:
                 if not partial_read:
@@ -502,5 +512,6 @@ class MediatedTools:
 
 class CommandInterrupted(OSError):
     def __init__(self, receipt):
-        super().__init__("command_interrupted_or_cleanup_unverified")
+        super().__init__(f"command_stalled: no activity for {round(receipt['idle_ms'] / 1000)} seconds"
+                         if receipt.get('stalled') is True else "command_interrupted_or_cleanup_unverified")
         self.receipt = receipt
