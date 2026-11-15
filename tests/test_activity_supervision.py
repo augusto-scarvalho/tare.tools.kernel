@@ -191,3 +191,25 @@ def test_only_what_the_host_bound_reaches_the_process(tmp_path, monkeypatch, bin
 def test_invalid_supervision_binding_is_refused(tmp_path, binding):
     with pytest.raises(ValueError):
         capabilities(tmp_path, **binding)
+
+
+def test_any_growth_of_cpu_time_is_activity_however_small():
+    # A tree bound by I/O: 5 ms of CPU a second, no output. Under a 1% threshold it read as silent for 300 s.
+    clock, cpu = [1000.0], [0.0]
+    watch = managed_process._Activity(300, None)
+    real = time.monotonic
+    try:
+        time.monotonic = lambda: clock[0]
+        result = {}
+        watch.start(result, lambda: cpu[0])
+        for _ in range(300):
+            clock[0] += 1; cpu[0] += 5
+            assert watch.stalled(0) is False
+        assert result['idle_ms'] == 0 and result['cpu_ms'] == 1500
+        for _ in range(299):
+            clock[0] += 1
+            assert watch.stalled(0) is False  # the CPU time stopped moving: silence starts counting
+        clock[0] += 1
+        assert watch.stalled(0) is True
+    finally:
+        time.monotonic = real
