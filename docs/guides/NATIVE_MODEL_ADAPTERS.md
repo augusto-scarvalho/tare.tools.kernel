@@ -32,7 +32,7 @@ existing limits.
 
 A host may also judge a command or verification by its activity. `idle_seconds`
 and `verification_idle_seconds` stop the protected `command` or a verification
-whose process tree wrote no output and used less than 1% CPU time (Windows job
+whose process tree wrote no output and used no CPU time (Windows job
 accounting, Linux `/proc` of the process group) for that long; the effect then
 says the process showed no activity for N seconds, and its process receipt
 carries `stalled`, `idle_ms` and `cpu_ms` next to `timeout`. `unbounded_command`

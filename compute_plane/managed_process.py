@@ -16,8 +16,6 @@ from threading import Thread, Event
 import time
 
 ACTIVITY_SAMPLE_SECONDS = 1.0
-# CPU growth that counts as work: 10 ms in a one-second sample. A process that only wakes on a timer does not.
-ACTIVITY_CPU_FRACTION = .01
 
 
 def host_executable(name, *, required=False):
@@ -271,8 +269,9 @@ class _Activity:
     def sample(self, output, now):
         cpu = self.read_cpu() if self.measured else None
         # A lost reading counts as work: a tree is never stopped for lack of a measurement.
-        working = self.measured and (cpu is None or cpu > self.cpu
-                                     and cpu - self.cpu >= ACTIVITY_CPU_FRACTION * (now - self.sampled) * 1000)
+        # Any measured CPU growth is work: a tree bound by I/O uses little of it (5 ms a second over five minutes
+        # read as silence under a 1% threshold), and a slow process must never be taken for a stopped one.
+        working = self.measured and (cpu is None or cpu > self.cpu)
         if working or output > self.result['output_bytes']:
             self.active_at = now
         if cpu is not None:
