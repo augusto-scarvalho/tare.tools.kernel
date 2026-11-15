@@ -11,8 +11,13 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 from threading import Thread, Event
 import time
+
+ACTIVITY_SAMPLE_SECONDS = 1.0
+# CPU growth that counts as work: 10 ms in a one-second sample. A process that only wakes on a timer does not.
+ACTIVITY_CPU_FRACTION = .01
 
 
 def host_executable(name, *, required=False):
@@ -132,11 +137,19 @@ class WindowsJob:
         if status != 0:
             raise OSError(f'NtResumeProcess failed: {status}')
 
-    def active(self):
+    def _accounting(self):
         info = self.Accounting()
         if not self.k.QueryInformationJobObject(self.handle, 1, self.c.byref(info), self.c.sizeof(info), None):
             raise self.c.WinError(self.c.get_last_error())
-        return info.active
+        return info
+
+    def active(self):
+        return self._accounting().active
+
+    def cpu_ms(self):
+        """User and kernel time of every process the job held, exited descendants included."""
+        info = self._accounting()
+        return (info.user + info.kernel) / 10000  # 100 ns units
 
     def _member_handles(self):
         """Pin current job members before termination, never reopen a historical PID."""
@@ -214,10 +227,90 @@ def _group_live(pgid):
         return False
 
 
-def run_process(argv, *, cwd, dest, timeout, env=None, stdin=b'', cancelled=lambda: False, max_output=2097152, process_factory=None):
-    """Return only after cleanup; unknown cleanup is a hard stop for the runner."""
+def _tree_cpu_ms(job, pgid):
+    """CPU time of the contained tree, or None where it is not measured (neither a Windows job nor Linux)."""
+    try:
+        if job:
+            return job.cpu_ms()
+        if not sys.platform.startswith('linux'):
+            return None
+        ticks = 0
+        for folder in Path('/proc').iterdir():
+            if folder.name.isdecimal():
+                try:
+                    fields = (folder / 'stat').read_text().rsplit(')', 1)[1].split()
+                    if int(fields[2]) == pgid:
+                        # utime, stime, and cutime, cstime: a reaped member's time moves to the member that reaped it.
+                        ticks += sum(map(int, fields[11:15]))
+                except (FileNotFoundError, ProcessLookupError):
+                    pass
+        return ticks * 1000 / os.sysconf('SC_CLK_TCK')
+    except Exception:
+        return None
+
+
+class _Activity:
+    """Output and tree CPU, sampled about once a second; each 20 ms poll in between only reads a clock."""
+
+    def __init__(self, idle_timeout, on_progress):
+        if (idle_timeout is not None and (type(idle_timeout) not in (int, float) or not idle_timeout > 0)
+                or on_progress is not None and not callable(on_progress)):
+            raise ValueError('positive idle_timeout and callable on_progress required')
+        self.idle_timeout, self.on_progress = idle_timeout, on_progress
+
+    def start(self, result, read_cpu):
+        self.result, self.read_cpu = result, read_cpu
+        self.started = self.sampled = self.active_at = time.monotonic()
+        self.cpu = read_cpu()
+        self.measured = self.cpu is not None
+        result.update(stalled=False, idle_ms=0, cpu_ms=self.cpu, output_bytes=0,
+                      activity='cpu+output' if self.measured else 'output')
+        if self.on_progress is not None:
+            result['progress_failures'] = 0
+
+    def sample(self, output, now):
+        cpu = self.read_cpu() if self.measured else None
+        # A lost reading counts as work: a tree is never stopped for lack of a measurement.
+        working = self.measured and (cpu is None or cpu > self.cpu
+                                     and cpu - self.cpu >= ACTIVITY_CPU_FRACTION * (now - self.sampled) * 1000)
+        if working or output > self.result['output_bytes']:
+            self.active_at = now
+        if cpu is not None:
+            self.result['cpu_ms'] += max(0, cpu - self.cpu)  # Linux: a member reaped outside the group drops out.
+            self.cpu = cpu
+        self.sampled = now
+        self.result.update(idle_ms=(now - self.active_at) * 1000, output_bytes=output)
+
+    def stalled(self, output):
+        """True once a measured tree showed no activity for idle_timeout; progress runs on this thread."""
+        now = time.monotonic()
+        if now - self.sampled < ACTIVITY_SAMPLE_SECONDS:
+            return False
+        self.sample(output, now)
+        if self.on_progress is not None:
+            try:
+                # A host that asks someone before stopping a silent tree gives no idle_timeout and answers here:
+                # exactly True stops the tree now, as a stall (the tree keeps running while the host decides).
+                if self.on_progress({'elapsed_ms': (now - self.started) * 1000, 'idle_ms': self.result['idle_ms'],
+                                     'cpu_ms': self.result['cpu_ms'], 'output_bytes': output}) is True:
+                    self.result['stopped_by_observer'] = True
+                    return True
+            except Exception:
+                self.result['progress_failures'] += 1
+        return self.measured and self.idle_timeout is not None and now - self.active_at >= self.idle_timeout
+
+
+def run_process(argv, *, cwd, dest, timeout, env=None, stdin=b'', cancelled=lambda: False, max_output=2097152, process_factory=None,
+                idle_timeout=None, on_progress=None):
+    """Return only after cleanup; unknown cleanup is a hard stop for the runner.
+
+    `idle_timeout` (seconds) stops the tree like `timeout` once it showed no output and no CPU work for that long
+    (`stalled`); it stops nothing where CPU is not measured. `on_progress` receives a sample about once a second.
+    Either one adds `stalled`, `idle_ms`, `cpu_ms`, `output_bytes` and `activity` to the result.
+    """
     if timeout <= 0:
         raise ValueError('positive wall budget required')
+    activity = _Activity(idle_timeout, on_progress) if idle_timeout is not None or on_progress is not None else None
     dest = Path(dest); dest.mkdir(parents=True, exist_ok=True)
     (dest / 'stdin.txt').write_bytes(stdin)
     started = time.perf_counter(); job = None; proc = None
@@ -237,6 +330,8 @@ def run_process(argv, *, cwd, dest, timeout, env=None, stdin=b'', cancelled=lamb
             proc = factory(argv, cwd=cwd, env=env, stdin=inp, stdout=out, stderr=err,
                 **({'creationflags': 0x4} if job else {'start_new_session': True}))
             result['pid'] = proc.pid
+            if activity:
+                activity.start(result, lambda: _tree_cpu_ms(job, proc.pid))
             confinement = getattr(proc, 'confinement_receipt', None)
             if confinement is not None:
                 result['confinement'] = dict(confinement)
@@ -263,12 +358,17 @@ def run_process(argv, *, cwd, dest, timeout, env=None, stdin=b'', cancelled=lamb
                     if out.tell() + err.tell() > max_output:
                         result['output_limit'] = True
                         break
+                    if activity and activity.stalled(out.tell() + err.tell()):
+                        result['stalled'] = True
+                        break
                     time.sleep(.02)
                 result['output_limit'] = out.tell() + err.tell() > max_output
                 result['exit_code'] = proc.poll()
             except subprocess.TimeoutExpired:
                 result['timeout'] = True
             finally:
+                if activity:
+                    activity.sample(out.tell() + err.tell(), time.monotonic())  # Before the kill ends the tree.
                 # Always clean up, including a host's partial result with exit 0.
                 result['descendants_at_exit'] = job.active() if job else int(_group_live(proc.pid))
                 if job:
@@ -303,7 +403,7 @@ def run_process(argv, *, cwd, dest, timeout, env=None, stdin=b'', cancelled=lamb
 
 
 def run_pipe_process(argv, *, cwd, timeout, stdin=b'', cancelled=lambda: False,
-                     max_output=2097152, env=None, on_stdout=None, completed=None):
+                     max_output=2097152, env=None, on_stdout=None, completed=None, idle_timeout=None, on_progress=None):
     """Finite trusted worker exchange, without persisting input or credentials.
 
     An owned finite writer keeps unread stdin off the supervising thread, including
@@ -312,9 +412,12 @@ def run_pipe_process(argv, *, cwd, timeout, stdin=b'', cancelled=lambda: False,
     Reuses host containment, never signals a PID recovered from a prior session.
     With on_stdout, a trusted completed callback may prove a terminal protocol
     before process exit. Its output is still drained and cleanup verified.
+    `idle_timeout` and `on_progress` supervise activity as in run_process (pipe bytes, stderr included).
     """
     if timeout <= 0 or type(max_output) is not int or max_output < 1:
         raise ValueError('positive execution bounds required')
+    activity = _Activity(idle_timeout, on_progress) if idle_timeout is not None or on_progress is not None else None
+    streamed = on_stdout is not None or activity is not None  # Reader threads count bytes as they arrive.
     started = time.monotonic()
     result = dict(exit_code=None, timeout=False, cancelled=False, output_limit=False,
                   cleanup_verified=False, containment='windows-job' if os.name == 'nt' else 'posix-process-group',
@@ -332,6 +435,8 @@ def run_pipe_process(argv, *, cwd, timeout, stdin=b'', cancelled=lambda: False,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             **({'creationflags': 0x4} if job else {'start_new_session': True}))
         result.update(started=True, pid=proc.pid)
+        if activity:
+            activity.start(result, lambda: _tree_cpu_ms(job, proc.pid))
         if job:
             job.assign_and_resume(proc)
         source = proc.stdin
@@ -351,6 +456,7 @@ def run_pipe_process(argv, *, cwd, timeout, stdin=b'', cancelled=lambda: False,
         writer.start()
         if on_stdout is not None:
             result['observer_failures'] = 0
+        if streamed:
             def read_output(stream, index):
                 observer = on_stdout if index == 0 else None
                 try:
@@ -378,7 +484,7 @@ def run_pipe_process(argv, *, cwd, timeout, stdin=b'', cancelled=lambda: False,
             if remaining <= 0:
                 result['timeout'] = True
                 break
-            if on_stdout is not None:
+            if streamed:
                 if overflow.is_set():
                     result['output_limit'] = True
                     break
@@ -389,6 +495,9 @@ def run_pipe_process(argv, *, cwd, timeout, stdin=b'', cancelled=lambda: False,
                     # The trusted adapter proved its terminal protocol boundary.
                     # Cleanup still drains the pipes and verifies the owned tree.
                     result['protocol_complete'] = True
+                    break
+                if activity and activity.stalled(len(buffers[0]) + len(buffers[1])):
+                    result['stalled'] = True
                     break
                 time.sleep(min(.02, remaining))
                 continue
@@ -404,6 +513,8 @@ def run_pipe_process(argv, *, cwd, timeout, stdin=b'', cancelled=lambda: False,
     finally:
         try:
             if proc:
+                if activity:
+                    activity.sample(len(buffers[0]) + len(buffers[1]), time.monotonic())  # Before the kill.
                 if job:
                     job.terminate()
                 else:
@@ -413,7 +524,7 @@ def run_pipe_process(argv, *, cwd, timeout, stdin=b'', cancelled=lambda: False,
                         pass
                 # Termination releases unread stdin and descendant-held pipes.
                 # A failure here propagates: cleanup is never declared by timeout.
-                if on_stdout is None:
+                if not streamed:
                     out, err = proc.communicate(timeout=5)
                 else:
                     for reader in readers:
