@@ -160,6 +160,29 @@ QUALIFICATION_SHAPE_FAILURES = frozenset({
     'CLI_INVALID_RESPONSE', 'CLI_STRUCTURED_OUTPUT_REJECTED'})
 PROBE_TEXT = 'Reply with the text OK and no actions.'
 PROBE_SECONDS = 60  # a hung probe must leave the real request most of its time
+# Measured on 2026-11-15 (real calls, tare's own commands, stdout bytes sampled each second): Claude Code's stdout never
+# stayed silent more than 1.5 s in a 102 s call (a heartbeat row about every 1.2 s while the model works), and in 60 s
+# with its API connection accepted but never answered it wrote nothing for 58 s while its CPU time still grew 703 ms.
+# Codex printed nothing for 92 s of a 95 s call and AGY for 376 s of a 381 s call: they show no life until the reply
+# is whole, so their silence says nothing and a silence window would only be a guess. They keep the total bound.
+SILENT_BY_DESIGN = frozenset({'cli://codex', 'cli://agy'})
+
+
+class _Silence:
+    """No byte on stdout for `seconds` ends the call. The tree's CPU time cannot judge it: a hung Claude Code still
+    ticks it (703 ms in 58 s), so run_pipe_process's own idle_timeout would never trip. Used as `on_stdout` (feed) and
+    `on_progress` (about once a second); exactly True stops the tree."""
+
+    def __init__(self, seconds, clock=time.monotonic):
+        self.seconds, self.clock = seconds, clock
+        self.last, self.idle_ms = clock(), 0
+
+    def feed(self, chunk):
+        self.last = self.clock()
+
+    def __call__(self, sample):
+        self.idle_ms = (self.clock() - self.last) * 1000
+        return self.idle_ms >= self.seconds * 1000
 
 
 class _Unqualified(Exception):
@@ -765,7 +788,7 @@ def claude_invocation(executable, root, body, env, guidance, *, tag=False, recor
 class VendorCliClient:
     def __init__(self, endpoint, *, executable, version, timeout_seconds=120,
                  request_byte_limit=1024*1024, model_catalog=None, qualification=None, vendor_guidance=None,
-                 **unused_transport):
+                 silence_seconds=None, **unused_transport):
         if (endpoint not in CLI_MINIMUM or not Path(executable).is_absolute()
                 or Path(executable).suffix.lower() in {'.cmd', '.bat'} or not version):
             raise ValueError('explicit vendor executable and reference version required')
@@ -778,10 +801,18 @@ class VendorCliClient:
         if (endpoint == 'cli://codex') != isinstance(model_catalog, dict):
             raise ValueError('Codex requires an explicit model catalog record')
         self.model_catalog = model_catalog
+        if silence_seconds is not None and (type(silence_seconds) not in (int, float)
+                                            or not math.isfinite(silence_seconds) or silence_seconds <= 0):
+            raise ValueError('positive finite silence window required')
+        # A silence window judges a call by its stdout instead of a total clock; where stdout says nothing while the
+        # model works (SILENT_BY_DESIGN) it is ignored and the call keeps its total bound.
+        self.silence_seconds = None if endpoint in SILENT_BY_DESIGN else silence_seconds
         if timeout_seconds is None:
-            timeout_seconds = 120  # The workflow can be unlimited; each CLI invocation stays bounded.
-        if timeout_seconds is None or not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
-            raise ValueError('finite CLI request timeout required')
+            # The workflow can be unlimited; each CLI invocation stays bounded: by its silence, or else by 120 s.
+            timeout_seconds = 120 if self.silence_seconds is None else math.inf
+        if timeout_seconds <= 0 or math.isnan(timeout_seconds) or (
+                math.isinf(timeout_seconds) and self.silence_seconds is None):
+            raise ValueError('finite CLI request timeout or a silence window required')
         self.endpoint, self.executable, self.version = endpoint, executable, version
         self.timeout_seconds = timeout_seconds
         self.request_byte_limit = min(request_byte_limit, AGY_REQUEST_BYTE_LIMIT) if endpoint == 'cli://agy' else request_byte_limit
@@ -1004,19 +1035,28 @@ class VendorCliClient:
                 try:
                     completion = (AgyCompletion(root, body['model'], 'response_schema' in body)
                                   if self.endpoint == 'cli://agy' else None)
+                    silence = _Silence(self.silence_seconds) if self.silence_seconds is not None else None
+                    feeds = [f.feed for f in (completion, silence) if f is not None]
                     physical, raw, errors = run_pipe_process(argv, cwd=root, env=env,
                         timeout=min(timeout, control.remaining_seconds()), stdin=source.encode('utf-8'),
                         cancelled=control.should_stop, max_output=4*1024*1024,
-                        **({'on_stdout': completion.feed, 'completed': completion.complete} if completion else {}))
+                        **({'on_stdout': lambda chunk: [feed(chunk) for feed in feeds]} if feeds else {}),
+                        **({'completed': completion.complete} if completion else {}),
+                        **({'on_progress': silence} if silence else {}))
                 except Exception:
                     receipt.update(started=None, cleanup_verified=False, remote_stop='unknown')
                     raise NativeTransportInterrupted('CLI_CLEANUP_UNCONFIRMED', receipt) from None
                 receipt.update(physical, remote_stop='unknown' if physical['started'] else 'not_dispatched')
                 receipt.update(stdin_bytes=len(source.encode('utf-8')),stdout_bytes=len(raw),stderr_bytes=len(errors))
-                if not physical['cleanup_verified'] or physical['cancelled'] or physical['timeout'] or physical['output_limit']:
+                silent = silence is not None and physical.get('stalled') is True and physical['cleanup_verified']
+                if silent:  # the sample's idle_ms counts CPU as work; the reason is stdout's silence
+                    receipt.update(idle_ms=silence.idle_ms, silence_seconds=self.silence_seconds)
+                if (not physical['cleanup_verified'] or physical['cancelled'] or physical['timeout']
+                        or physical['output_limit'] or silent):
                     if self.endpoint == 'cli://agy':
                         agy_progress(root, raw, receipt)
-                    raise NativeTransportInterrupted('CLI_INCOMPLETE_EXCHANGE', receipt)
+                    raise NativeTransportInterrupted('CLI_SILENT_EXCHANGE' if silent else 'CLI_INCOMPLETE_EXCHANGE',
+                                                     receipt)
                 rows = [object_json(line) for line in raw.splitlines() if line.strip()]
                 if self.endpoint == 'cli://agy':
                     hook_file = root/'boundary.jsonl'

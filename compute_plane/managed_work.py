@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,8 +33,11 @@ class VerificationCommand:
             raise ValueError("criterion must be non-empty")
         if not self.argv or any(not isinstance(part, str) or not part for part in self.argv):
             raise ValueError("argv must contain explicit non-empty arguments")
-        if self.timeout_seconds is not None and (self.timeout_seconds <= 0 or self.timeout_seconds > 300):
-            raise ValueError("timeout_seconds must be between 0 and 300, or None")
+        # Any positive finite ceiling, or None; a host that judges the command by its activity needs more than 300 s.
+        if self.timeout_seconds is not None and (
+                not isinstance(self.timeout_seconds, (int, float)) or not math.isfinite(self.timeout_seconds)
+                or self.timeout_seconds <= 0):
+            raise ValueError("timeout_seconds must be a positive finite number, or None")
 
 
 @dataclass(frozen=True)
