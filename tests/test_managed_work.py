@@ -163,3 +163,14 @@ def test_progress_rejects_workspace_escape(tmp_path) -> None:
             tracked_paths=(tmp_path.parent,),
             runner=runner,
         )
+
+
+@pytest.mark.parametrize("seconds", [7200, 300.5, 0.5, None])
+def test_verification_ceiling_is_any_positive_finite_number_or_none(seconds) -> None:
+    assert VerificationCommand("tests", ("verify",), timeout_seconds=seconds).timeout_seconds == seconds
+
+
+@pytest.mark.parametrize("seconds", [0, -1, float("nan"), float("inf"), "300"])
+def test_verification_ceiling_still_refuses_zero_negative_and_non_finite(seconds) -> None:
+    with pytest.raises(ValueError, match="positive finite"):
+        VerificationCommand("tests", ("verify",), timeout_seconds=seconds)
