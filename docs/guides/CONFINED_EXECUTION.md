@@ -189,8 +189,9 @@ are not measured.
 
 ## Unsandboxed POSIX children: owner stamp
 
-Without a `process_factory`, `run_process`, `run_pipe_process` and the audit
-driver start their child through `owned_popen`. On POSIX its environment gets
+Without a `process_factory`, `run_process` (checks and commands) starts its child
+through `owned_popen`; vendor CLI calls (`run_pipe_process`) and the audit driver
+do not. On POSIX its environment gets
 `TARE_OWNER=<pid>:<start time>`, naming the process that started it (Linux:
 field 22 of `/proc/<pid>/stat`), and every descendant inherits it. On Linux a
 fresh interpreter (`owned_exec.py`, so the threaded host runs no `preexec_fn`)

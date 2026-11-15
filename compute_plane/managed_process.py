@@ -494,7 +494,7 @@ def run_pipe_process(argv, *, cwd, timeout, stdin=b'', cancelled=lambda: False,
     try:
         if os.name == 'nt':
             job = WindowsJob()
-        proc = owned_popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE,
+        proc = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             **({'creationflags': 0x4} if job else {'start_new_session': True}))
         result.update(started=True, pid=proc.pid)
