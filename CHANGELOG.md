@@ -4,6 +4,7 @@ Notable changes to `tare.tools.kernel` are recorded here, newest first.
 
 ## Unreleased
 
+- The one correction turn covers any proposal that does not fit the delivery schema, not a list of codes: a further real run was rejected for a value outside its allowed set (`literal_error`). A rejection that is not about form (an unread source, an ignored target path) keeps its own rule.
 - The correction turn of a rejected typed delivery now tells the model which fields were rejected and why (field path and error code, never content). The message said "correct the listed fields" and listed none: the issues stayed in the journal, and the rejected reply is not resent, so the model had to guess.
 - The one correction turn of a typed delivery covers every wrong shape (any `*_type` issue), not only a list sent as text: in a further real run the entries of `criteria` and `remaining` were objects where text belongs (`string_type`), and that session ended the same way. Still one correction per session, inside the call budget.
 - A typed delivery whose list field arrives in another shape (`list_type`) gets the one correction turn a missing field already gets, instead of ending the session. Seen on a local model whose plan carried long quoted examples: `tasks` was not a list in 2 of 3 deliveries and the session ended with ten calls left. Still one correction per session, inside the original call budget, and nothing from the rejected reply is accepted.

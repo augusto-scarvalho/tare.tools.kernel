@@ -134,9 +134,11 @@ def test_invalid_delivery_never_logs_rejected_input_values(protocol):
     adapter=NativeModelAdapter(profile(protocol),Client([value]),system='test',tool_specs_json=SPECS,
         validate_delivery=lambda data:Delivery.model_validate(data).model_dump(),
         delivery_schema_json=json.dumps(Delivery.model_json_schema()),observe=rows.append)
-    with pytest.raises(ModelFailure):adapter.generate(request(),execution())
-    assert 'PRIVATE-TEXT' not in json.dumps(rows)
-    assert rows[0]['delivery_validation']['issues'][0]['field']=='summary'
+    first=adapter.generate(request(),execution())  # a mistake of form gets the one correction turn
+    assert not first.proposes_delivery and first.tool_calls==()
+    recovery=json.loads(first.metadata_json)['recovery']
+    assert 'PRIVATE-TEXT' not in json.dumps(rows) and 'PRIVATE-TEXT' not in json.dumps(recovery)  # nor in what the model is told
+    assert json.loads(first.metadata_json)['recovery']['issues'][0]['field']=='summary'
 
 
 @pytest.mark.parametrize('lines,text,accepted', [(1,'',False),(0,'',True),(1,'1: value = 1',True)])

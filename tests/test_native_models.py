@@ -537,15 +537,19 @@ def test_typed_delivery_can_be_corrected_once_within_the_original_budget(protoco
 
 @pytest.mark.parametrize('wrong,issue', [
     ({'summary': 'Observed', 'tasks': json.dumps(['a', 'b'])}, {'field': 'tasks', 'code': 'list_type'}),
-    ({'summary': 'Observed', 'tasks': [{'text': 'a'}]}, {'field': 'tasks.0', 'code': 'string_type'})],
-    ids=['a list sent as text', 'an object where text belongs'])
-def test_a_field_sent_in_another_shape_gets_the_one_correction_turn(wrong, issue):
+    ({'summary': 'Observed', 'tasks': [{'text': 'a'}]}, {'field': 'tasks.0', 'code': 'string_type'}),
+    ({'summary': 'Observed', 'tasks': ['a', 'b'], 'priority': 'urgent'}, {'field': 'priority', 'code': 'literal_error'})],
+    ids=['a list sent as text', 'an object where text belongs', 'a value outside its allowed set'])
+def test_a_proposal_that_does_not_fit_the_schema_gets_the_one_correction_turn(wrong, issue):
     from dataclasses import asdict
     from pydantic import BaseModel
+
+    from typing import Literal
 
     class Plan(BaseModel):
         summary: str
         tasks: list[str]
+        priority: Literal['low', 'high'] = 'low'
 
     bad = response('openai-chat', DELIVERY_TOOL, wrong)
     good = response('openai-chat', DELIVERY_TOOL, {'summary': 'Observed', 'tasks': ['a', 'b']})
