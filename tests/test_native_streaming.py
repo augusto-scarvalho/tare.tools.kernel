@@ -6,7 +6,8 @@ import io,json,struct,time,zlib
 from threading import Event,Thread
 
 import pytest
-from compute_plane.native_stream import chat,converse,messages
+from compute_plane.native_gemini import to_chat as gemini_to_chat
+from compute_plane.native_stream import chat,converse,generate_content,messages
 from compute_plane.native_models import ModelProfile,NativeHttpClient,NativeModelAdapter,NativeTransportInterrupted
 from tare_tools_agent_runtime import ConversationLog,NativeSession
 from tests.test_native_models import profile,request,execution,SPECS
@@ -462,3 +463,276 @@ def test_anthropic_event_stream_without_the_terminal_blank_line_or_cut_mid_event
     with pytest.raises(ValueError,match='stream_truncated_event'):
         messages(io.BytesIO(raw+b'event: error\ndata: {"type":"error","error":'),lambda e:None)
     with pytest.raises(ValueError,match='stream_missing_done'):chat(io.BytesIO(b''.join(chat_parts()[:-1])),lambda e:None)
+
+
+# --- gemini-generate-content: :streamGenerateContent, no [DONE], the last chunk carries finishReason ---------------
+
+GEMINI='gemini-generate-content'
+GEMINI_PATH='/models/fixture:streamGenerateContent'
+THOUGHT_SIGNATURE='Cj0B+/ólá-thought-signature=='
+CALL={'args':{'summary':'olá'},'id':'call-1','name':'tare_deliver'}
+
+
+def gchunk(*parts,finish=None,usage=None,**extra):
+    candidate={'content':{'parts':list(parts),'role':'model'},'index':0}
+    if finish:candidate['finishReason']=finish
+    return {'candidates':[candidate],'modelVersion':'fixture','responseId':'r1',**({} if usage is None else {'usageMetadata':usage}),**extra}
+
+
+def gemini_chunks():
+    """Shapes seen on 2026-11-17: text in pieces, a signed call whole, usage empty then growing, a trailing empty part."""
+    return [gchunk({'text':'thinking ','thought':True},usage={}),gchunk({'text':'more','thought':True},usage={}),
+        gchunk({'text':'olá '},usage={'promptTokenCount':20,'candidatesTokenCount':2}),gchunk({'text':'mundo'}),
+        gchunk({'functionCall':CALL,'thoughtSignature':THOUGHT_SIGNATURE},usage={'promptTokenCount':20,'candidatesTokenCount':7}),
+        gchunk({'text':''},finish='STOP',usage={'promptTokenCount':20,'candidatesTokenCount':9,'totalTokenCount':29})]
+
+
+def gemini_whole():
+    return {'modelVersion':'fixture','candidates':[{'content':{'role':'model','parts':[
+        {'text':'thinking more','thought':True},{'text':'olá mundo'},
+        {'functionCall':CALL,'thoughtSignature':THOUGHT_SIGNATURE}]},'finishReason':'STOP'}],
+        'usageMetadata':{'promptTokenCount':20,'candidatesTokenCount':9,'totalTokenCount':29}}
+
+
+def gemini_parts(chunks=None):return [sse(c) for c in (gemini_chunks() if chunks is None else chunks)]
+
+
+def gemini_decode(chunks,emit=lambda e:None):return generate_content(io.BytesIO(b''.join(map(sse,chunks))),emit)
+
+
+def gemini_adapter(url,**kwargs):
+    return NativeModelAdapter(ModelProfile(GEMINI,'fixture',32768,1024,'fixture',url),NativeHttpClient(url),
+        system='system',tool_specs_json=SPECS,counter_protocol='utf8-envelope-estimate-v1',**kwargs)
+
+
+def test_gemini_stream_rebuilds_exactly_what_the_whole_answer_gives_and_emits_what_it_should():
+    events=[]
+    got=gemini_decode(gemini_chunks(),events.append)
+    assert got==gemini_whole() and gemini_to_chat(got)==gemini_to_chat(gemini_whole())
+    assert [(e['kind'],e.get('channel')) for e in events]==[('delta','reasoning_content'),('delta','reasoning_content'),
+        ('usage',None),('delta','text'),('delta','text'),('usage',None),('delta','tool_name'),('delta','tool_arguments'),
+        ('usage',None)]
+    assert [e['text'] for e in events if e['kind']=='delta' and e['channel']=='text']==['olá ','mundo']
+    assert {e['index'] for e in events if e.get('channel','').startswith('tool_')}=={0}
+    assert THOUGHT_SIGNATURE not in json.dumps(events)
+    assert events[-1]['usage']==gemini_whole()['usageMetadata']
+
+
+def test_gemini_stream_through_the_adapter_posts_the_same_body_to_the_streaming_path_and_replays_the_signature():
+    from dataclasses import asdict
+    from tare_tools_agent_runtime import ProjectionSpec
+    with serving(GEMINI,parts=gemini_parts()) as (url,seen,*_):
+        rows,progress=[],[]
+        adapter=gemini_adapter(url,streaming=True,on_progress=progress.append,observe=rows.append)
+        reply=adapter.generate(request(),real_control())
+        assert reply.complete and reply.proposes_delivery and len(seen)==1
+        assert seen[0][0]==GEMINI_PATH and seen[0][1]==gemini_adapter(url).wire(request())
+        assert 'stream' not in seen[0][1] and 'stream_options' not in seen[0][1]
+        assert rows[0]['transport_calls'][0]['stream_status']=='COMPLETE' and rows[0]['usage']==gemini_whole()['usageMetadata']
+        assert rows[0]['observed_model']=='fixture' and rows[0]['model_identity']=='matched'
+        assert all(e['provisional'] for e in progress) and [e['channel'] for e in progress][:2]==['reasoning_content']*2
+        log=ConversationLog();log.append({'kind':'model_returned','call_id':request().call_id,'reply':asdict(reply)})
+        wire=adapter.wire(replace(request(),call_id='s/model/2',context=log.project(ProjectionSpec(1,'native-full-v1'))))
+        model_turn=next(c for c in wire['contents'] if c['role']=='model')
+        assert model_turn['parts']==gemini_whole()['candidates'][0]['content']['parts']
+
+
+def test_gemini_nonstreaming_request_and_path_are_unchanged():
+    plain=gemini_adapter('http://fixture')
+    assert plain._generation_path(streaming=False)=='/models/fixture:generateContent'
+    assert gemini_adapter('http://fixture',streaming=True)._generation_path(streaming=True)==GEMINI_PATH
+    assert gemini_adapter('http://fixture',streaming=True).wire(request())==plain.wire(request())
+
+
+def test_gemini_first_delta_is_delivered_before_server_releases_the_rest():
+    parts=gemini_parts();parts=[parts[2],*parts[:2],*parts[3:]]  # the gate holds after a first text delta
+    with serving(GEMINI,parts=parts,gate=True) as (url,seen,release,first):
+        events=[]
+        def progress(event):
+            if not events: assert not release.is_set()
+            events.append(event);release.set()
+        response,receipt=NativeHttpClient(url).post_stream_observed(GEMINI_PATH,{},real_control(),protocol=GEMINI,on_event=progress)
+        assert events[0]['channel']=='text' and receipt['stream_observer_failures']==0 and receipt['first_content_ms'] is not None
+        assert response['candidates'][0]['finishReason']=='STOP'
+
+
+def test_gemini_cut_stream_never_becomes_delivery_and_resume_does_not_retry():
+    with serving(GEMINI,parts=gemini_parts(),cut=True) as (url,seen,*_):
+        log=ConversationLog();rows=[]
+        session=NativeSession(session_id='s',instruction='task',capabilities=('read','edit','verify'),
+            model=gemini_adapter(url,streaming=True,observe=rows.append),tools=None,journal=log)
+        assert session.run(real_control()).status=='reconciliation_required'
+        assert session.run(real_control()).status=='reconciliation_required' and len(seen)==1
+        call=rows[0]['transport_calls'][0]
+        assert call['stream_status']=='INCOMPLETE' and call['stream_failure_reason']=='stream_missing_completion'
+
+
+def test_gemini_error_chunk_keeps_a_fixed_diagnostic_without_provider_text():
+    parts=gemini_parts()[:2]+[sse({'error':{'code':500,'message':'private-provider-value','status':'INTERNAL'}})]
+    with serving(GEMINI,parts=parts) as (url,seen,*_):
+        with pytest.raises(NativeTransportInterrupted) as caught:
+            NativeHttpClient(url).post_stream_observed(GEMINI_PATH,{},real_control(),protocol=GEMINI)
+        receipt=caught.value.transport_observation
+        assert receipt['stream_failure_reason']=='stream_provider_error' and 'private-provider-value' not in json.dumps(receipt)
+
+
+def test_gemini_signed_parts_stay_whole_and_filler_and_other_kinds_are_handled_as_sent():
+    other={'executableCode':{'language':'PYTHON','code':'1'}}
+    got=gemini_decode([gchunk({'text':'a'},{'text':'b'},{'text':'','thought':True},{'text':'c','thoughtSignature':'s1'},{'text':'d'},
+        {'text':'e'},{'text':'','thoughtSignature':'s2'},{'text':'f'},{'thoughtSignature':'s3'},other,{'text':'g'},
+        {'functionCall':{'name':'x'}},{'functionCall':{'name':'y'}}),gchunk({'text':''},finish='STOP')])
+    assert got['candidates'][0]['content']['parts']==[{'text':'ab'},{'text':'c','thoughtSignature':'s1'},{'text':'de'},
+        {'text':'','thoughtSignature':'s2'},{'text':'f'},{'thoughtSignature':'s3'},other,{'text':'g'},
+        {'functionCall':{'name':'x'}},{'functionCall':{'name':'y'}}]
+    with pytest.raises(ValueError,match='gemini_output_type_unsupported'):gemini_to_chat(got)  # refused later, not here
+
+
+def test_gemini_usage_latest_non_empty_wins_and_a_usage_only_chunk_is_fine():
+    chunks=gemini_chunks()
+    chunks.insert(3,{'modelVersion':'fixture','usageMetadata':{'promptTokenCount':20,'candidatesTokenCount':3}})
+    assert gemini_decode(chunks)['usageMetadata']==gemini_whole()['usageMetadata']
+    chunks[-1]['usageMetadata']={}  # an empty one at the end does not erase the last count
+    assert gemini_decode(chunks)['usageMetadata']=={'promptTokenCount':20,'candidatesTokenCount':7}
+    chunks[-1]['usageMetadata']={'promptTokenCount':19}  # latest wins, it is not compared
+    assert gemini_decode(chunks)['usageMetadata']=={'promptTokenCount':19}
+    chunks.append({'modelVersion':'fixture','usageMetadata':{'promptTokenCount':20,'candidatesTokenCount':10}})
+    assert gemini_decode(chunks)['usageMetadata']['candidatesTokenCount']==10  # after finish, no content: allowed
+
+
+@pytest.mark.parametrize('damage,reason',[
+    ('two_candidates','stream_one_choice_required'),('candidates_not_list','stream_one_choice_required'),
+    ('candidate_index','stream_choice_order'),('role','stream_role'),('parts_not_list','stream_part_shape'),
+    ('part_not_object','stream_part_shape'),('text_not_string','stream_text_required'),
+    ('model_changed','stream_model_changed'),('text_after_finish','stream_choice_order'),
+    ('call_after_finish','stream_choice_order'),('signed_empty_after_finish','stream_choice_order'),
+    ('finish_changes','stream_choice_order'),('no_finish','stream_missing_completion'),
+    ('too_many_parts','stream_part_shape'),('usage_not_object','stream_object_required'),
+    ('error_after_text','stream_provider_error'),('error_with_candidates','stream_provider_error')])
+def test_gemini_decoder_refuses_what_it_cannot_rebuild(damage,reason):
+    chunks=gemini_chunks()
+    first,last=chunks[0]['candidates'][0],chunks[-1]['candidates'][0]
+    if damage=='two_candidates':chunks[1]['candidates']=[first,first]
+    if damage=='candidates_not_list':chunks[1]['candidates']={}
+    if damage=='candidate_index':first['index']=1
+    if damage=='role':first['content']['role']='user'
+    if damage=='parts_not_list':first['content']['parts']={'text':'x'}
+    if damage=='part_not_object':first['content']['parts']=['x']
+    if damage=='text_not_string':first['content']['parts']=[{'text':7}]
+    if damage=='model_changed':chunks[2]['modelVersion']='another'
+    if damage=='text_after_finish':chunks.append(gchunk({'text':'late'}))
+    if damage=='call_after_finish':chunks.append(gchunk({'functionCall':CALL}))
+    if damage=='signed_empty_after_finish':chunks.append(gchunk({'text':'','thoughtSignature':'s'}))
+    if damage=='finish_changes':chunks.append(gchunk(finish='MAX_TOKENS'))
+    if damage=='no_finish':last.pop('finishReason')
+    if damage=='too_many_parts':chunks.insert(2,gchunk(*[{'functionCall':{'name':'x'}}]*129))
+    if damage=='usage_not_object':chunks[2]['usageMetadata']=[1]
+    if damage=='error_after_text':chunks.insert(4,{'error':{'message':'private'}})
+    if damage=='error_with_candidates':chunks[2]['error']={}
+    with pytest.raises(ValueError,match=reason):gemini_decode(chunks)
+
+
+def test_gemini_stream_is_bounded_and_an_event_cut_short_is_refused():
+    raw=b''.join(gemini_parts())
+    with pytest.raises(ValueError,match='stream_truncated_event'):generate_content(io.BytesIO(raw[:-2]),lambda e:None)
+    with pytest.raises(ValueError,match='stream_truncated_event|stream_missing_completion'):
+        generate_content(io.BytesIO(raw[:-40]),lambda e:None)
+    with pytest.raises(ValueError,match='stream_missing_completion'):generate_content(io.BytesIO(b''.join(gemini_parts()[:-1])),lambda e:None)
+    # a complete answer followed by the start of another event, cut anywhere (half a field name, a field with no
+    # blank line after it), is never a delivery: for this protocol and for the Messages one, which share the reader
+    for tail in (b'data',b'dat',b'event: error\n',b'data: {"error":',b': note\ndata: {"error":{}}\n'):
+        with pytest.raises(ValueError,match='stream_truncated_event'):generate_content(io.BytesIO(raw+tail),lambda e:None)
+        with pytest.raises(ValueError,match='stream_truncated_event'):
+            messages(io.BytesIO(b''.join(anthropic_parts())+tail),lambda e:None)
+    for tail in (b'\n\n',b': keepalive\n',b': keepalive'):  # blank lines and comments are no event
+        assert generate_content(io.BytesIO(raw+tail),lambda e:None)['candidates'][0]['finishReason']
+    from compute_plane import native_stream
+    limit=native_stream.MAX_EVENTS
+    try:
+        native_stream.MAX_EVENTS=3
+        with pytest.raises(ValueError,match='stream_event_limit'):generate_content(io.BytesIO(raw),lambda e:None)
+    finally:native_stream.MAX_EVENTS=limit
+
+
+# --- Google's OpenAI-compatible endpoint: whole calls without `index`, usage on every chunk, growing -----------------
+
+EXTRA={'google':{'thought_signature':'opaque-sig','future':[1,{'a':'b'}]}}
+
+
+def compat_call(name,arguments,call_id,**extra):
+    return {'function':{'arguments':arguments,'name':name},'id':call_id,'type':'function',**extra}
+
+
+def compat_chunks(usage=None):
+    usage=usage or [{'completion_tokens':16,'prompt_tokens':123,'total_tokens':269},
+                    {'completion_tokens':32,'prompt_tokens':123,'total_tokens':285},
+                    {'completion_tokens':32,'prompt_tokens':123,'total_tokens':285}]
+    frame=lambda delta,u,finish=None:{'model':'fixture','choices':[{'index':0,'delta':{'role':'assistant',**delta},'finish_reason':finish}],'usage':u}
+    return [frame({'tool_calls':[compat_call('report_number','{"n":1}','c-one',extra_content=EXTRA)]},usage[0]),
+            frame({'tool_calls':[compat_call('report_text','{"t":"x"}','c-two')]},usage[1]),
+            frame({},usage[2],'stop')]
+
+
+def compat_decode(chunks,emit=lambda e:None):return chat(io.BytesIO(b''.join([*map(sse,chunks),b'data: [DONE]\n\n'])),emit)
+
+
+def test_compat_index_less_whole_calls_are_rebuilt_in_order_equal_to_the_nonstreaming_message_with_growing_usage():
+    events=[];got=compat_decode(compat_chunks(),events.append)
+    whole=[compat_call('report_number','{"n":1}','c-one',extra_content=EXTRA),compat_call('report_text','{"t":"x"}','c-two')]
+    # the endpoint ends this stream with `stop` and the same answer sent whole with `tool_calls`: rebuilt as the whole
+    assert got['choices'][0]['message']['tool_calls']==whole and got['choices'][0]['finish_reason']=='tool_calls'
+    assert got['usage']=={'completion_tokens':32,'prompt_tokens':123,'total_tokens':285}
+    assert [e['usage']['completion_tokens'] for e in events if e['kind']=='usage']==[16,32,32]
+    assert [(e['channel'],e['index']) for e in events if e['kind']=='delta']==[('tool_name',0),('tool_arguments',0),('tool_name',1),('tool_arguments',1)]
+
+
+def test_stop_after_indexed_tool_calls_is_not_turned_into_a_complete_reply():
+    call={'index':0,'id':'c-one','type':'function','function':{'name':'report_number','arguments':'{}'}}
+    frame=lambda delta,finish=None:{'model':'fixture','choices':[{'index':0,'delta':delta,'finish_reason':finish}]}
+    got=compat_decode([frame({'tool_calls':[call]}),frame({},'stop')])
+    assert got['choices'][0]['finish_reason']=='stop' and len(got['choices'][0]['message']['tool_calls'])==1
+    text_only=compat_decode([frame({'content':'hi'}),frame({},'stop')])
+    assert text_only['choices'][0]['finish_reason']=='stop'
+
+
+def test_compat_stream_through_the_worker_keeps_the_last_usage():
+    parts=[*map(sse,compat_chunks()),b'data: [DONE]\n\n']
+    with serving(parts=parts) as (url,*_):
+        response,receipt=NativeHttpClient(url).post_stream_observed('/chat/completions',{},real_control(),protocol='openai-chat')
+        assert response['usage']['completion_tokens']==32 and receipt['stream_usage']['completion_tokens']==32
+        assert receipt['stream_status']=='COMPLETE'
+
+
+@pytest.mark.parametrize('damage',['index_then_bare','bare_then_index','no_id','empty_id','no_name','empty_name','name_not_text',
+                                   'no_function','id_only_fragment','arguments_fragment'])
+def test_compat_index_less_calls_are_accepted_only_whole_and_never_mixed_with_indexed_ones(damage):
+    chunks=compat_chunks()
+    first,second=chunks[0]['choices'][0]['delta']['tool_calls'],chunks[1]['choices'][0]['delta']['tool_calls']
+    if damage=='index_then_bare':first[0]['index']=0
+    if damage=='bare_then_index':second[0]['index']=1
+    if damage=='no_id':del second[0]['id']
+    if damage=='empty_id':second[0]['id']=''
+    if damage=='no_name':del second[0]['function']['name']
+    if damage=='empty_name':second[0]['function']['name']=''
+    if damage=='name_not_text':second[0]['function']['name']=7
+    if damage=='no_function':del second[0]['function']
+    if damage=='id_only_fragment':second[0]={'id':'c-two'}
+    if damage=='arguments_fragment':second[0]={'function':{'arguments':'more'}}
+    with pytest.raises(ValueError,match='stream_tool_index'):compat_decode(chunks)
+
+
+@pytest.mark.parametrize('first,second',[
+    ({'completion_tokens':16},{'completion_tokens':15}),
+    ({'prompt_tokens':123,'completion_tokens':16},{'prompt_tokens':122,'completion_tokens':16}),
+    ({'completion_tokens':16,'cost':1.0},{'completion_tokens':16,'cost':1.5}),
+    ({'details':{'cached':5}},{'details':{'cached':4}})])
+def test_usage_that_shrinks_or_changes_in_a_non_count_is_still_refused(first,second):
+    with pytest.raises(ValueError,match='stream_usage_changed'):compat_decode(compat_chunks([first,second,second]))
+
+
+def test_an_openai_style_stream_is_rebuilt_as_before():
+    got=chat(io.BytesIO(b''.join(chat_parts(tool=True))),lambda e:None)
+    assert got['choices'][0]['message']['tool_calls']==[{'id':'t1','type':'function',
+        'function':{'name':'tare_deliver','arguments':'{"summary":"olá"}'}}]
+    assert got['usage']=={'prompt_tokens':20,'completion_tokens':5} and got['choices'][0]['finish_reason']=='tool_calls'
+    with pytest.raises(ValueError,match='stream_tool_index'):  # an indexed fragment must still carry an index
+        compat_decode([{'model':'fixture','choices':[{'index':0,'delta':{'tool_calls':[{'function':{'arguments':'x'}}]}}]}])

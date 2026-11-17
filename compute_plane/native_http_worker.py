@@ -31,7 +31,7 @@ STREAM_REASONS = frozenset({
     'stream_reasoning_details_shape',
     'stream_provider_error', 'stream_message_start', 'stream_missing_start', 'stream_message_delta',
     'stream_after_message_stop', 'stream_unclosed_blocks', 'stream_block_index', 'stream_block_start',
-    'stream_duplicate_block', 'stream_unknown_block', 'stream_unsupported_block', 'stream_unsupported_delta',
+    'stream_part_shape', 'stream_duplicate_block', 'stream_unknown_block', 'stream_unsupported_block', 'stream_unsupported_delta',
     'stream_block_type_changed', 'stream_block_after_message_delta', 'stream_truncated_event',
     'responses_item_shape', 'responses_item_identity', 'responses_duplicate_item_id',
     'responses_duplicate_item_index', 'responses_item_changed', 'responses_unfinished_item',

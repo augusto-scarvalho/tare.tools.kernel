@@ -14,8 +14,8 @@ def to_generate_content(chat_wire):
     wire = copy.deepcopy(chat_wire)
     source = wire.pop('messages')
     system = source.pop(0)
-    if system['role'] != 'system' or wire.get('stream'):
-        raise ValueError('gemini_system_and_nonstream_required')
+    if system['role'] != 'system':  # `stream` and `stream_options` never reach the body: the path says it
+        raise ValueError('gemini_system_required')
     contents, calls, previous = [], {}, None
     for message in source:
         role, content = message['role'], message['content']
