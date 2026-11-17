@@ -1312,6 +1312,12 @@ class NativeModelAdapter:
                             'in this session, using their observed repository, path and hash. Remove unread citations '
                             'and report their obligations in remaining; never invent evidence. Reuse your reads; '
                             'do not repeat the investigation. One correction fits the remaining original call budget.'}
+                        # The message is all the model gets on the next turn (the rejected reply is not resent):
+                        # name the fields, or "the listed fields" lists nothing. Paths and codes, never content.
+                        recovery['message'] += (' Rejected fields: ' + '; '.join(
+                            '%s (%s)' % (i['field'], i['code']) for i in rejected.issues) + '. A field marked '
+                            'missing must be given; one marked with a type must be sent in the shape the delivery '
+                            'schema states for it.')
                         if any(i['code']=='native_artifact_ignored_target' for i in rejected.issues):
                             recovery['message'] += (' Git ignores a planned output at the listed field. Choose a '
                                 'versioned target path; do not change ignore rules or force-track private outputs.')

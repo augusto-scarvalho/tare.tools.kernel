@@ -518,6 +518,7 @@ def test_typed_delivery_can_be_corrected_once_within_the_original_budget(protoco
     assert not first.proposes_delivery and first.tool_calls == ()
     meta = json.loads(first.metadata_json)
     assert meta['recovery']['issues'] == [{'field': 'path', 'code': 'missing'}]
+    assert 'Rejected fields: path (missing).' in meta['recovery']['message']
     assert 'delivery_payload' not in meta and observed[0]['usage'] == usage
     assert len(adapter.client.calls) == 1  # correction is a normal new turn, never a transport retry
     log = ConversationLog()
@@ -554,6 +555,8 @@ def test_a_field_sent_in_another_shape_gets_the_one_correction_turn(wrong, issue
     first = adapter.generate(replace(request(), remaining_model_calls=3), execution())
     assert not first.proposes_delivery
     assert json.loads(first.metadata_json)['recovery']['issues'] == [issue]
+    # the message is all the model sees on the next turn: it names the field and what was wrong with it
+    assert '%s (%s)' % (issue['field'], issue['code']) in json.loads(first.metadata_json)['recovery']['message']
     log = ConversationLog()
     log.append({'kind': 'model_returned', 'call_id': request().call_id, 'reply': asdict(first)})
     second = adapter.generate(replace(request(), call_id='s/model/2', remaining_model_calls=2,
