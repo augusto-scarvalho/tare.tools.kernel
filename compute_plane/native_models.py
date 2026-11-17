@@ -36,9 +36,15 @@ MAX_REQUEST_BYTES = 32 * 1024 * 1024
 DELIVERY_TOOL = "tare_deliver"
 TRUNCATED_TOOL_CALL = "malformed_tool_call"  # NInfer, when the output limit cuts a call
 INVALID_CLI_REPLY = "invalid_cli_reply"  # vendor CLI turn whose answer is not the JSON object
-# list_type: a field that must be a list arrived as something else. Seen 2026-11-17 on a local model whose plan
-# carried long quoted examples: `tasks` was not a list in 2 of 3 deliveries, and the session ended with calls left.
-REPAIRABLE_DELIVERY_ISSUES = frozenset({'missing','list_type','native_artifact_source_not_observed','native_artifact_ignored_target'})
+REPAIRABLE_DELIVERY_ISSUES = frozenset({'missing','native_artifact_source_not_observed','native_artifact_ignored_target'})
+
+
+def repairable(issue):
+    """Whether the model can fix this by sending the same proposal again in the right form: a field it left out,
+    or a field in the wrong shape (a `*_type` code: a list sent as text, an object where text belongs). Seen
+    2026-11-17 on a local model whose plan carried long quoted examples: `tasks` was not a list in two deliveries
+    and the entries of `criteria` were not text in a third, and each session ended with calls left."""
+    return issue['code'] in REPAIRABLE_DELIVERY_ISSUES or issue['code'].endswith('_type')
 STAND_IN_CALLS = {
     TRUNCATED_TOOL_CALL: {'code': 'TRUNCATED_TOOL_CALL', 'message':
         'The previous response reached the output limit before its tool call was closed. No tools from '
@@ -1289,7 +1295,7 @@ class NativeModelAdapter:
                         continue
                     rejected = DeliveryRejected(exc)
                     if (self.validate_delivery is not None and request.purpose == 'model'
-                            and rejected.issues and all(i['code'] in REPAIRABLE_DELIVERY_ISSUES for i in rejected.issues)
+                            and rejected.issues and all(repairable(i) for i in rejected.issues)
                             and (request.remaining_model_calls is None or
                                  type(request.remaining_model_calls) is int and request.remaining_model_calls > 1)
                             and not getattr(self, '_typed_delivery_repaired', False)

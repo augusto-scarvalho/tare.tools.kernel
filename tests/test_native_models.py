@@ -534,7 +534,11 @@ def test_typed_delivery_can_be_corrected_once_within_the_original_budget(protoco
         restarted.generate(followup, execution())
 
 
-def test_a_list_field_sent_in_another_shape_gets_the_one_correction_turn():
+@pytest.mark.parametrize('wrong,issue', [
+    ({'summary': 'Observed', 'tasks': json.dumps(['a', 'b'])}, {'field': 'tasks', 'code': 'list_type'}),
+    ({'summary': 'Observed', 'tasks': [{'text': 'a'}]}, {'field': 'tasks.0', 'code': 'string_type'})],
+    ids=['a list sent as text', 'an object where text belongs'])
+def test_a_field_sent_in_another_shape_gets_the_one_correction_turn(wrong, issue):
     from dataclasses import asdict
     from pydantic import BaseModel
 
@@ -542,14 +546,14 @@ def test_a_list_field_sent_in_another_shape_gets_the_one_correction_turn():
         summary: str
         tasks: list[str]
 
-    bad = response('openai-chat', DELIVERY_TOOL, {'summary': 'Observed', 'tasks': json.dumps(['a', 'b'])})
+    bad = response('openai-chat', DELIVERY_TOOL, wrong)
     good = response('openai-chat', DELIVERY_TOOL, {'summary': 'Observed', 'tasks': ['a', 'b']})
     adapter = NativeModelAdapter(profile('openai-chat'), Client([bad, good]), system='Stable', tool_specs_json=SPECS,
         delivery_schema_json=json.dumps(Plan.model_json_schema()),
         validate_delivery=lambda args: Plan.model_validate(args).model_dump(), observe=lambda row: None)
     first = adapter.generate(replace(request(), remaining_model_calls=3), execution())
     assert not first.proposes_delivery
-    assert json.loads(first.metadata_json)['recovery']['issues'] == [{'field': 'tasks', 'code': 'list_type'}]
+    assert json.loads(first.metadata_json)['recovery']['issues'] == [issue]
     log = ConversationLog()
     log.append({'kind': 'model_returned', 'call_id': request().call_id, 'reply': asdict(first)})
     second = adapter.generate(replace(request(), call_id='s/model/2', remaining_model_calls=2,
