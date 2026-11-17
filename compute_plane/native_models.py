@@ -36,7 +36,9 @@ MAX_REQUEST_BYTES = 32 * 1024 * 1024
 DELIVERY_TOOL = "tare_deliver"
 TRUNCATED_TOOL_CALL = "malformed_tool_call"  # NInfer, when the output limit cuts a call
 INVALID_CLI_REPLY = "invalid_cli_reply"  # vendor CLI turn whose answer is not the JSON object
-REPAIRABLE_DELIVERY_ISSUES = frozenset({'missing','native_artifact_source_not_observed','native_artifact_ignored_target'})
+# list_type: a field that must be a list arrived as something else. Seen 2026-11-17 on a local model whose plan
+# carried long quoted examples: `tasks` was not a list in 2 of 3 deliveries, and the session ended with calls left.
+REPAIRABLE_DELIVERY_ISSUES = frozenset({'missing','list_type','native_artifact_source_not_observed','native_artifact_ignored_target'})
 STAND_IN_CALLS = {
     TRUNCATED_TOOL_CALL: {'code': 'TRUNCATED_TOOL_CALL', 'message':
         'The previous response reached the output limit before its tool call was closed. No tools from '

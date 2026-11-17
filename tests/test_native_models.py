@@ -534,6 +534,29 @@ def test_typed_delivery_can_be_corrected_once_within_the_original_budget(protoco
         restarted.generate(followup, execution())
 
 
+def test_a_list_field_sent_in_another_shape_gets_the_one_correction_turn():
+    from dataclasses import asdict
+    from pydantic import BaseModel
+
+    class Plan(BaseModel):
+        summary: str
+        tasks: list[str]
+
+    bad = response('openai-chat', DELIVERY_TOOL, {'summary': 'Observed', 'tasks': json.dumps(['a', 'b'])})
+    good = response('openai-chat', DELIVERY_TOOL, {'summary': 'Observed', 'tasks': ['a', 'b']})
+    adapter = NativeModelAdapter(profile('openai-chat'), Client([bad, good]), system='Stable', tool_specs_json=SPECS,
+        delivery_schema_json=json.dumps(Plan.model_json_schema()),
+        validate_delivery=lambda args: Plan.model_validate(args).model_dump(), observe=lambda row: None)
+    first = adapter.generate(replace(request(), remaining_model_calls=3), execution())
+    assert not first.proposes_delivery
+    assert json.loads(first.metadata_json)['recovery']['issues'] == [{'field': 'tasks', 'code': 'list_type'}]
+    log = ConversationLog()
+    log.append({'kind': 'model_returned', 'call_id': request().call_id, 'reply': asdict(first)})
+    second = adapter.generate(replace(request(), call_id='s/model/2', remaining_model_calls=2,
+                                      context=log.project(ProjectionSpec(1, 'native-full-v1'))), execution())
+    assert second.proposes_delivery and json.loads(second.metadata_json)['delivery_payload']['tasks'] == ['a', 'b']
+
+
 def test_invalid_typed_delivery_without_remaining_repair_room_stays_failed():
     observed = []
     adapter = typed_adapter('openai-chat', [response('openai-chat', DELIVERY_TOOL)], observed)
