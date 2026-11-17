@@ -663,8 +663,6 @@ class NativeModelAdapter:
         if profile.protocol == 'vendor-cli' and (streaming or image_media_types
                 or counter_protocol != 'utf8-envelope-estimate-v1'):
             raise ValueError('vendor_cli_requires_text_input_and_explicit_estimate')
-        if profile.protocol == 'anthropic-messages' and streaming:
-            raise ValueError('anthropic_messages_streaming_unsupported')
         if profile.protocol == 'gemini-generate-content' and streaming:
             raise ValueError('gemini_generate_content_streaming_unsupported')
         self.streaming, self.on_progress = streaming, on_progress

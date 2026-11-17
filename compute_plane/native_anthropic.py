@@ -9,9 +9,9 @@ def to_messages(chat_wire, *, cache_system=False):
     wire = copy.deepcopy(chat_wire)
     source = wire.pop('messages')
     system = source.pop(0)
-    if system['role'] != 'system' or wire.get('stream'):
-        raise ValueError('anthropic_system_and_nonstream_required')
-    wire.pop('stream_options', None)
+    if system['role'] != 'system':
+        raise ValueError('anthropic_system_required')
+    wire.pop('stream_options', None)  # `stream` itself is the Messages API's own switch and stays as asked
     wire['system'] = [{'type': 'text', 'text': system['content']}]
     if cache_system:
         wire['system'][0]['cache_control'] = copy.deepcopy(wire.get('cache_control', {'type':'ephemeral'}))

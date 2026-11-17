@@ -38,7 +38,9 @@ class Reader:
         return value
 
 
-def sse(stream):
+def sse(stream, done=True):
+    # done=False: the protocol ends by its own last event (Anthropic has no [DONE]); the caller must
+    # then judge a stream that merely ended.
     reader, data, events = Reader(stream), [], 0
     while line := reader.line():
         line = line.rstrip(b'\r\n')
@@ -47,13 +49,16 @@ def sse(stream):
                 events += 1
                 if events > MAX_EVENTS: raise ValueError('stream_event_limit')
                 value = b'\n'.join(data).decode('utf-8'); data = []
-                if value == '[DONE]':
+                if done and value == '[DONE]':
                     yield None
                     return
                 yield obj(value)
         elif line.startswith(b'data:'):
             data.append(line[5:].removeprefix(b' '))
-    raise ValueError('stream_missing_done')
+    if done: raise ValueError('stream_missing_done')
+    # No sentinel: the stream ends when the server closes it. Data with no blank line after it is an event cut
+    # short, never one to drop quietly (it may be the provider's error).
+    if data: raise ValueError('stream_truncated_event')
 
 
 def eventstream(stream):
@@ -251,7 +256,97 @@ def converse(stream, emit):
             'stopReason':stopped, **(metadata or {})}
 
 
+EVENTS = {'message_start', 'content_block_start', 'content_block_delta', 'content_block_stop',
+          'message_delta', 'message_stop'}
+# What the Messages API's own stream documentation shows, and nothing else: (block type, field).
+DELTAS = {'text_delta':('text','text'), 'thinking_delta':('thinking','thinking'),
+          'signature_delta':('thinking','signature'), 'input_json_delta':('tool_use','partial_json')}
+
+
+def messages(stream, emit):
+    """Rebuild the object a non-streaming /messages call returns from its server-sent events."""
+    message, usage, stopped, ending = None, None, False, False
+    blocks, closed, partial = {}, set(), {}
+
+    def count(update):
+        # Usage counts are cumulative: a later count replaces an earlier one of the same name.
+        nonlocal usage
+        if not isinstance(update, dict): raise ValueError('stream_object_required')
+        usage = {**(usage or {}), **update}; emit({'kind':'usage','usage':usage})
+
+    for value in sse(stream, done=False):
+        kind = value.get('type')
+        if kind == 'error': raise ValueError('stream_provider_error')  # never keep the provider's text
+        if stopped: raise ValueError('stream_after_message_stop')
+        if kind not in EVENTS: continue  # ping, and event types the API may add
+        if kind == 'message_start':
+            start = value.get('message')
+            if (message is not None or not isinstance(start, dict) or start.get('type') != 'message'
+                    or start.get('role') != 'assistant' or start.get('content') != []):
+                raise ValueError('stream_message_start')
+            message = copy.deepcopy(start)
+            if message.get('usage') is not None: count(message['usage'])
+            continue
+        if message is None: raise ValueError('stream_missing_start')
+        if kind == 'message_delta':
+            delta = value.get('delta')
+            if not isinstance(delta, dict) or {'id','type','role','model','content','usage'} & set(delta):
+                raise ValueError('stream_message_delta')
+            # The message's own end: every block is closed by now, and none may open or grow after it.
+            if set(blocks) != closed: raise ValueError('stream_unclosed_blocks')
+            ending = True
+            message.update(delta)
+            if value.get('usage') is not None: count(value['usage'])
+            continue
+        if kind == 'message_stop':
+            if set(blocks) != closed: raise ValueError('stream_unclosed_blocks')
+            stopped = True; continue
+        if ending: raise ValueError('stream_block_after_message_delta')
+        index = value.get('index')
+        if type(index) is not int or not 0 <= index < 128: raise ValueError('stream_block_index')
+        if kind == 'content_block_start':
+            if index in blocks: raise ValueError('stream_duplicate_block')
+            if index != len(blocks): raise ValueError('stream_block_index')  # the index is its place in content
+            block = value.get('content_block')
+            if not isinstance(block, dict): raise ValueError('stream_block_start')
+            match block.get('type'):
+                case 'text': whole = block.get('text') == ''
+                case 'thinking':  # the signature key may be absent at the start: it arrives in its own delta
+                    whole = block.get('thinking') == '' and block.get('signature', '') == ''
+                case 'redacted_thinking': whole = isinstance(block.get('data'), str) and block['data'] != ''
+                case 'tool_use':
+                    whole = isinstance(block.get('id'), str) and isinstance(block.get('name'), str) and block.get('input') == {}
+                    partial[index] = ''
+                case _: raise ValueError('stream_unsupported_block')  # server tools, fallback, anything else
+            if not whole: raise ValueError('stream_block_start')
+            blocks[index] = copy.deepcopy(block)
+            if block['type'] == 'thinking': blocks[index].setdefault('signature', '')
+            continue
+        if index not in blocks or index in closed: raise ValueError('stream_unknown_block')
+        block = blocks[index]
+        if kind == 'content_block_delta':
+            delta = value.get('delta')
+            field = DELTAS.get(delta.get('type')) if isinstance(delta, dict) else None
+            if field is None: raise ValueError('stream_unsupported_delta')
+            if block['type'] != field[0]: raise ValueError('stream_block_type_changed')
+            fragment = text(delta.get(field[1]))
+            if delta['type'] == 'text_delta': block['text'] += fragment
+            elif delta['type'] == 'thinking_delta': block['thinking'] += fragment
+            elif delta['type'] == 'signature_delta':
+                block['signature'] += fragment  # replayed to the API: kept byte for byte, joined if it comes in parts
+            else: partial[index] += fragment
+            if fragment and delta['type'] != 'signature_delta':
+                emit({'kind':'delta','channel':{'text_delta':'text','thinking_delta':'reasoning_content'}.get(delta['type'],'tool_arguments'),
+                      'text':fragment, **({'index':index} if block['type']=='tool_use' else {})})
+        else:  # content_block_stop
+            if block['type'] == 'tool_use': block['input'] = obj(partial[index]) if partial[index] else {}
+            closed.add(index)
+    if not stopped or not isinstance(message.get('stop_reason'), str): raise ValueError('stream_missing_completion')
+    return {**message, 'content':[blocks[i] for i in sorted(blocks)], 'usage':usage}
+
+
 def decode(stream, protocol, emit):
+    if protocol == 'anthropic-messages': return messages(stream, emit)
     if protocol in {'openai-codex-responses', 'openai-responses'}:
         if __package__:
             from .native_responses_stream import decode as responses
