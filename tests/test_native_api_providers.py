@@ -230,13 +230,11 @@ def test_anthropic_invalid_response_rejects_whole_batch(mutation):
     assert rows[-1]['status'] == 'invalid_response' and rows[-1]['usage'] == value['usage']
 
 
-def test_anthropic_truncated_batch_has_no_effects_and_streaming_refused():
+def test_anthropic_truncated_batch_has_no_effects():
     client = Client([anthropic(stop='max_tokens')])
     reply = model('anthropic-messages', client).generate(request(), execution())
     assert not reply.tool_calls and not reply.proposes_delivery
     assert json.loads(reply.metadata_json)['recovery']['code'] == 'TRUNCATED_TOOL_CALL'
-    with pytest.raises(ValueError):
-        model('anthropic-messages', StreamClient([]), streaming=True)
     with pytest.raises(ValueError, match='support evidence'):
         model('anthropic-messages', Client([]), profile_args={'cache_system': True})
 

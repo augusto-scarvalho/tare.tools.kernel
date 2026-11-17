@@ -103,7 +103,13 @@ another provider, or create a second runtime. NativeSession still owns tools.
   fragments fail closed rather than silently discarding a signature. Tool result
   IDs stay linked through the common history validator. No SDK is required.
 - `anthropic-messages`: endpoint `https://api.anthropic.com/v1`, POST `/messages`.
-  JSON only initially: `streaming=True` is rejected before dispatch. Text, local
+  `streaming=True` sends `"stream": true` and rebuilds the non-streaming message
+  from the Messages server-sent events (`message_start`, content blocks,
+  `message_delta`, `message_stop`; there is no `[DONE]`, and a stream that ends
+  before `message_stop` is incomplete). Text, thinking (signature kept byte for
+  byte), redacted thinking and `tool_use` blocks stream; hosted-tool blocks, unknown
+  block or delta types and any order violation fail closed. Usage is cumulative:
+  the last count of each name wins. Text, local
   tool use/results, configured inline image media types, signed thinking and
   redacted thinking replay through a small common-history conversion. Hosted
   tools and unknown content blocks are refused as a whole. Exact response model,
@@ -497,7 +503,9 @@ behavior remains the default for consumers that do not opt in. The host must
 still count the whole candidate context, and edits still require hash validation.
 
 Kernel 0.9.3 adds explicit `NativeModelAdapter(..., streaming=True,
-on_progress=...)` and `NativeHttpClient.post_stream_observed`. Chat uses SSE;
+on_progress=...)` and `NativeHttpClient.post_stream_observed`. Streaming
+protocols: `openai-chat`, `openai-responses`, `openai-codex-responses`,
+`anthropic-messages` and `bedrock-converse`; `gemini-generate-content` is refused. Chat uses SSE;
 Bedrock uses the official [ConverseStream](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ConverseStream.html)
 binary EventStream framing with prelude/message CRC validation. Only complete
 messages pass the existing reply/tool validator. Provisional deltas carry no
