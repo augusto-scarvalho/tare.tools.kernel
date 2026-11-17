@@ -518,6 +518,7 @@ def test_typed_delivery_can_be_corrected_once_within_the_original_budget(protoco
     assert not first.proposes_delivery and first.tool_calls == ()
     meta = json.loads(first.metadata_json)
     assert meta['recovery']['issues'] == [{'field': 'path', 'code': 'missing'}]
+    assert 'Rejected fields: path (missing).' in meta['recovery']['message']
     assert 'delivery_payload' not in meta and observed[0]['usage'] == usage
     assert len(adapter.client.calls) == 1  # correction is a normal new turn, never a transport retry
     log = ConversationLog()
@@ -532,6 +533,39 @@ def test_typed_delivery_can_be_corrected_once_within_the_original_budget(protoco
     restarted = typed_adapter(protocol, [bad], [])
     with pytest.raises(ModelFailure, match='INVALID_DELIVERY'):
         restarted.generate(followup, execution())
+
+
+@pytest.mark.parametrize('wrong,issue', [
+    ({'summary': 'Observed', 'tasks': json.dumps(['a', 'b'])}, {'field': 'tasks', 'code': 'list_type'}),
+    ({'summary': 'Observed', 'tasks': [{'text': 'a'}]}, {'field': 'tasks.0', 'code': 'string_type'}),
+    ({'summary': 'Observed', 'tasks': ['a', 'b'], 'priority': 'urgent'}, {'field': 'priority', 'code': 'literal_error'})],
+    ids=['a list sent as text', 'an object where text belongs', 'a value outside its allowed set'])
+def test_a_proposal_that_does_not_fit_the_schema_gets_the_one_correction_turn(wrong, issue):
+    from dataclasses import asdict
+    from pydantic import BaseModel
+
+    from typing import Literal
+
+    class Plan(BaseModel):
+        summary: str
+        tasks: list[str]
+        priority: Literal['low', 'high'] = 'low'
+
+    bad = response('openai-chat', DELIVERY_TOOL, wrong)
+    good = response('openai-chat', DELIVERY_TOOL, {'summary': 'Observed', 'tasks': ['a', 'b']})
+    adapter = NativeModelAdapter(profile('openai-chat'), Client([bad, good]), system='Stable', tool_specs_json=SPECS,
+        delivery_schema_json=json.dumps(Plan.model_json_schema()),
+        validate_delivery=lambda args: Plan.model_validate(args).model_dump(), observe=lambda row: None)
+    first = adapter.generate(replace(request(), remaining_model_calls=3), execution())
+    assert not first.proposes_delivery
+    assert json.loads(first.metadata_json)['recovery']['issues'] == [issue]
+    # the message is all the model sees on the next turn: it names the field and what was wrong with it
+    assert '%s (%s)' % (issue['field'], issue['code']) in json.loads(first.metadata_json)['recovery']['message']
+    log = ConversationLog()
+    log.append({'kind': 'model_returned', 'call_id': request().call_id, 'reply': asdict(first)})
+    second = adapter.generate(replace(request(), call_id='s/model/2', remaining_model_calls=2,
+                                      context=log.project(ProjectionSpec(1, 'native-full-v1'))), execution())
+    assert second.proposes_delivery and json.loads(second.metadata_json)['delivery_payload']['tasks'] == ['a', 'b']
 
 
 def test_invalid_typed_delivery_without_remaining_repair_room_stays_failed():
