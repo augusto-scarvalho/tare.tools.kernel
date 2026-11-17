@@ -137,8 +137,10 @@ another provider, or create a second runtime. NativeSession still owns tools.
   OpenAI Chat still forces its nested named function choice; OpenAI Responses and
   Codex Responses still force `{'type': 'function', 'name': 'tare_deliver'}`.
 - `gemini-generate-content`: Gemini's own API, POST `/models/<model>:generateContent` under the profile endpoint
-  (OpenCode: `https://opencode.ai/inference/go/google/v1beta`), with the common Bearer credential. JSON only:
-  `streaming=True` is rejected before dispatch. The system prompt is `systemInstruction`, the output limit is
+  (OpenCode: `https://opencode.ai/inference/go/google/v1beta`), with the common Bearer credential. With
+  `streaming=True` the path ends in `:streamGenerateContent` (no query string; the answer is server-sent events with
+  no `[DONE]`) and the request body is the same; `native_stream.generate_content` rebuilds the object a whole call
+  returns (the `gemini-generate-content` paragraph on streaming below). The system prompt is `systemInstruction`, the output limit is
   `generationConfig.maxOutputTokens`, and the profile parameters `temperature`, `topP`, `topK`, `stopSequences`
   and `thinkingConfig` go into `generationConfig`; any other parameter is refused. Tools are
   `functionDeclarations` with `parametersJsonSchema`; the choice is `AUTO`, or `ANY` restricted to `tare_deliver`
@@ -505,7 +507,7 @@ still count the whole candidate context, and edits still require hash validation
 Kernel 0.9.3 adds explicit `NativeModelAdapter(..., streaming=True,
 on_progress=...)` and `NativeHttpClient.post_stream_observed`. Streaming
 protocols: `openai-chat`, `openai-responses`, `openai-codex-responses`,
-`anthropic-messages` and `bedrock-converse`; `gemini-generate-content` is refused. Chat uses SSE;
+`anthropic-messages`, `gemini-generate-content` and `bedrock-converse`. Chat uses SSE;
 Bedrock uses the official [ConverseStream](https://docs.aws.amazon.com/bedrock/latest/APIReference/API_runtime_ConverseStream.html)
 binary EventStream framing with prelude/message CRC validation. Only complete
 messages pass the existing reply/tool validator. Provisional deltas carry no
@@ -526,6 +528,29 @@ can repeat the same terminal choice with an empty delta. Accept one such account
 frame only; reject later content, tools, opaque deltas, a different finish reason
 or a second accounting choice. Keep usage once. Chat shape failures retain fixed
 allowlisted diagnostics without returning provider values or exception text.
+
+`gemini-generate-content` streaming (`native_stream.generate_content`): each `data:` line is one partial
+GenerateContentResponse, there is no `[DONE]`, and the stream ends at EOF, only after a chunk that carried
+`finishReason` (EOF without one is `stream_missing_completion`). Each chunk has at most one candidate (`index` 0,
+role `model`, `parts` a list; a usage-only chunk is fine). Parts are appended in order; text pieces join only when
+both are plain text with the same `thought` flag and neither carries a `thoughtSignature`, so a signed part and a
+`functionCall` stay exactly as sent (they are replayed to the API) and any other part kind is kept for `to_chat` to
+refuse. An empty unsigned text part is dropped. `usageMetadata` is the latest non-empty one; `modelVersion` may
+not change; after `finishReason` no chunk may carry a part that is kept or a different reason; at most 128 parts; an
+`error` chunk is `stream_provider_error` and its text is never kept. The result has the shape of a whole call
+(`candidates`, `modelVersion`, `usageMetadata`), so `to_chat` and everything after it are unchanged. Observations
+are `text`, `reasoning_content` (a `thought` part), `tool_name` and `tool_arguments` (a call arrives whole), and
+`usage`; a signature is never emitted.
+
+Google's OpenAI-compatible endpoint (`openai-chat`) sends each tool call whole and without `index`, and `usage` on
+every chunk, growing. `native_stream.chat` places an index-less call at the next position only when it is whole (a
+non-empty `id` and `function.name`); a stream that mixes calls with and without `index`, or an index-less fragment,
+is still `stream_tool_index`. `usage` may change between chunks when it is cumulative (every integer count present
+in both has not shrunk, anything else in both is equal; the latest wins); otherwise `stream_usage_changed`.
+`extra_content` (the thought signature) is kept exactly. That endpoint ends a streamed answer that
+calls tools with `finish_reason` `stop` and the same answer sent whole with `tool_calls` (seen for real,
+2026-11-17); `chat` rebuilds `tool_calls` for that form of call only (whole, without `index`), so `stop` after
+indexed calls is still an incomplete reply.
 
 Responses terminal failure handling (2026-09-21): a `response.failed` event with
 a stable, nonempty response ID and explicit `status=failed` closes inference as

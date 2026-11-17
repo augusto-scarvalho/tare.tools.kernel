@@ -41,9 +41,11 @@ class Reader:
 def sse(stream, done=True):
     # done=False: the protocol ends by its own last event (Anthropic has no [DONE]); the caller must
     # then judge a stream that merely ended.
-    reader, data, events = Reader(stream), [], 0
+    reader, data, events, pending = Reader(stream), [], 0, False
     while line := reader.line():
         line = line.rstrip(b'\r\n')
+        if line.startswith(b':'): continue  # a comment (a keep-alive): no field of any event
+        pending = bool(line)  # any field line since the last blank one
         if not line:
             if data:
                 events += 1
@@ -56,9 +58,9 @@ def sse(stream, done=True):
         elif line.startswith(b'data:'):
             data.append(line[5:].removeprefix(b' '))
     if done: raise ValueError('stream_missing_done')
-    # No sentinel: the stream ends when the server closes it. Data with no blank line after it is an event cut
-    # short, never one to drop quietly (it may be the provider's error).
-    if data: raise ValueError('stream_truncated_event')
+    # No sentinel: the stream ends when the server closes it. Anything after the last blank line (data, another
+    # field, half a field name) is an event cut short, never one to drop quietly (it may be the provider's error).
+    if pending: raise ValueError('stream_truncated_event')
 
 
 def eventstream(stream):
@@ -124,14 +126,27 @@ def _reasoning_fragments(target, fragments):
             target.append(copy.deepcopy(item))
 
 
+def _cumulative(old, new):
+    """True when `new` can follow `old` as running usage: every integer count in both has not shrunk, anything
+    else in both is equal. Names in only one of them are free."""
+    if isinstance(old, dict) and isinstance(new, dict):
+        return all(_cumulative(old[key], new[key]) for key in old.keys() & new.keys())
+    if type(old) is int and type(new) is int: return new >= old
+    return old == new
+
+
 def chat(stream, emit):
     model, finish, usage, fleet, timings = None, None, None, None, None
-    accounted = False
+    accounted, bare = False, None  # bare: whether the tool calls come without `index` (never a mix)
     assistant, tools = {'role':'assistant','content':''}, {}
     for value in sse(stream):
         if value is None:
             if model is None or finish is None: raise ValueError('stream_missing_completion')
             if tools: assistant['tool_calls'] = [tools[i] for i in sorted(tools)]
+            # Google's compatible endpoint ends a streamed answer that calls tools with `stop`, and the same answer
+            # sent whole with `tool_calls` (seen for real, 2026-11-17). Rebuild what the whole call returns; only
+            # for its form of call (whole, without index), so `stop` after indexed calls stays an incomplete reply.
+            if bare and finish == 'stop': finish = 'tool_calls'
             result = {'model':model,'choices':[{'index':0,'message':assistant,'finish_reason':finish}], 'usage':usage}
             if fleet is not None: result['tare_fleet_observation'] = fleet
             if timings is not None: result['timings'] = timings
@@ -147,7 +162,7 @@ def chat(stream, emit):
             if fleet is not None: raise ValueError('stream_duplicate_fleet_receipt')
             fleet = value['tare_fleet_observation']
         if value.get('usage') is not None:
-            if usage is not None and usage != value['usage']: raise ValueError('stream_usage_changed')
+            if usage is not None and not _cumulative(usage, value['usage']): raise ValueError('stream_usage_changed')
             usage = value['usage']; emit({'kind':'usage','usage':usage})
         choices = value.get('choices', [])
         if not isinstance(choices,list) or len(choices)>1: raise ValueError('stream_one_choice_required')
@@ -178,6 +193,16 @@ def chat(stream, emit):
                 if fragment: emit({'kind':'delta','channel':'text' if key=='content' else key,'text':fragment})
         for call in delta.get('tool_calls', []):
             index = call.get('index')
+            if 'index' not in call:
+                # Google's compatible endpoint sends each call whole and without an index. Only a whole call (id and
+                # name) is placed, in arrival order; a bare fragment could not be told from the call before it.
+                function = call.get('function')
+                if (not isinstance(call.get('id'), str) or not call['id'] or not isinstance(function, dict)
+                        or not isinstance(function.get('name'), str) or not function['name']):
+                    raise ValueError('stream_tool_index')
+                index = len(tools)
+            if bare not in (None, 'index' not in call): raise ValueError('stream_tool_index')
+            bare = 'index' not in call
             if type(index) is not int or not 0 <= index < 32: raise ValueError('stream_tool_index')
             target = tools.setdefault(index, {'id':'','type':'function','function':{'name':'','arguments':''}})
             if call.get('type','function') != 'function': raise ValueError('stream_tool_type')
@@ -345,8 +370,67 @@ def messages(stream, emit):
     return {**message, 'content':[blocks[i] for i in sorted(blocks)], 'usage':usage}
 
 
+def generate_content(stream, emit):
+    """Rebuild the object a non-streaming :generateContent call returns from its server-sent events.
+
+    There is no sentinel: the stream ends at EOF, and only after a chunk that carried `finishReason`.
+    """
+    parts, finish, model, usage, calls = [], None, None, None, 0
+    for value in sse(stream, done=False):
+        if 'error' in value: raise ValueError('stream_provider_error')  # never keep the provider's text
+        if value.get('modelVersion') is not None:
+            if model is not None and model != value['modelVersion']: raise ValueError('stream_model_changed')
+            model = text(value['modelVersion'])
+        if value.get('usageMetadata'):  # `{}` on early chunks: the latest non-empty count is the running total
+            if not isinstance(value['usageMetadata'], dict): raise ValueError('stream_object_required')
+            usage = value['usageMetadata']; emit({'kind':'usage','usage':usage})
+        candidates = value.get('candidates', [])
+        if not isinstance(candidates, list) or len(candidates) > 1 or candidates and not isinstance(candidates[0], dict):
+            raise ValueError('stream_one_choice_required')
+        if not candidates: continue
+        candidate = candidates[0]
+        if candidate.get('index', 0) != 0: raise ValueError('stream_choice_order')
+        content = candidate.get('content') or {}
+        if not isinstance(content, dict) or content.get('role', 'model') != 'model': raise ValueError('stream_role')
+        incoming = content.get('parts', [])
+        if not isinstance(incoming, list): raise ValueError('stream_part_shape')
+        for part in incoming:
+            if not isinstance(part, dict): raise ValueError('stream_part_shape')
+            kinds = set(part) - {'thought', 'thoughtSignature'}
+            if kinds == {'text'} and not text(part['text']) and 'thoughtSignature' not in part: continue  # filler
+            if finish is not None: raise ValueError('stream_choice_order')  # nothing may follow the end
+            if kinds == {'text'}:
+                previous = parts[-1] if parts else {}
+                # Pieces of one text join. A signed part is replayed to the API, so it stays whole as sent.
+                if (set(part) <= {'text', 'thought'} and set(previous) <= {'text', 'thought'} and 'text' in previous
+                        and previous.get('thought') is part.get('thought')):
+                    previous['text'] += part['text']
+                else: parts.append(copy.deepcopy(part))
+                if part['text']:
+                    emit({'kind':'delta','channel':'reasoning_content' if part.get('thought') is True else 'text',
+                          'text':part['text']})
+            else:
+                parts.append(copy.deepcopy(part))
+                call = part.get('functionCall')
+                if kinds == {'functionCall'} and isinstance(call, dict):  # arrives whole; shown, never executed here
+                    if isinstance(call.get('name'), str) and call['name']:
+                        emit({'kind':'delta','channel':'tool_name','index':calls,'text':call['name']})
+                    if call.get('args'):
+                        emit({'kind':'delta','channel':'tool_arguments','index':calls,
+                              'text':json.dumps(call['args'], ensure_ascii=False, sort_keys=True)})
+                if kinds == {'functionCall'}: calls += 1
+            if len(parts) > 128: raise ValueError('stream_part_shape')
+        if candidate.get('finishReason') is not None:
+            if finish is not None and finish != candidate['finishReason']: raise ValueError('stream_choice_order')
+            finish = text(candidate['finishReason'])
+    if finish is None: raise ValueError('stream_missing_completion')
+    return {'candidates':[{'content':{'role':'model','parts':parts},'finishReason':finish}],
+            'modelVersion':model, 'usageMetadata':usage}
+
+
 def decode(stream, protocol, emit):
     if protocol == 'anthropic-messages': return messages(stream, emit)
+    if protocol == 'gemini-generate-content': return generate_content(stream, emit)
     if protocol in {'openai-codex-responses', 'openai-responses'}:
         if __package__:
             from .native_responses_stream import decode as responses

@@ -663,8 +663,6 @@ class NativeModelAdapter:
         if profile.protocol == 'vendor-cli' and (streaming or image_media_types
                 or counter_protocol != 'utf8-envelope-estimate-v1'):
             raise ValueError('vendor_cli_requires_text_input_and_explicit_estimate')
-        if profile.protocol == 'gemini-generate-content' and streaming:
-            raise ValueError('gemini_generate_content_streaming_unsupported')
         self.streaming, self.on_progress = streaming, on_progress
         specs = object_json(tool_specs_json)
         if response_mode not in {"tools", "text"} or (response_mode == "text" and specs):
@@ -1036,7 +1034,7 @@ class NativeModelAdapter:
         if self.profile.protocol == 'openai-chat':
             return '/chat/completions'
         if self.profile.protocol == 'gemini-generate-content':
-            return '/models/' + urllib.parse.quote(self.profile.model, safe='') + ':generateContent'
+            return '/models/' + urllib.parse.quote(self.profile.model, safe='') + (':streamGenerateContent' if streaming else ':generateContent')
         return self._path('converse-stream' if streaming else 'converse')
 
     def _path(self, operation):

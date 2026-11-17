@@ -498,7 +498,7 @@ def test_gemini_invalid_response_rejects_whole_batch(mutation):
     assert rows[-1]['status'] == 'invalid_response' and rows[-1]['usage'] == value['usageMetadata']
 
 
-def test_gemini_incomplete_replies_have_no_effects_and_streaming_is_refused():
+def test_gemini_incomplete_replies_have_no_effects():
     reply = model(GEMINI, Client([gemini(stop='MAX_TOKENS')])).generate(request(), execution())
     assert not reply.tool_calls and not reply.proposes_delivery
     assert json.loads(reply.metadata_json)['recovery']['code'] == 'TRUNCATED_TOOL_CALL'
@@ -510,8 +510,6 @@ def test_gemini_incomplete_replies_have_no_effects_and_streaming_is_refused():
         reply = model(GEMINI, Client([value]), observe=rows.append).generate(request(), execution())
         assert not reply.tool_calls and not reply.proposes_delivery and not reply.complete
         assert json.loads(reply.metadata_json)['provider_stop_reason'] == reason and rows[-1]['status'] == 'partial'
-    with pytest.raises(ValueError, match='streaming'):
-        model(GEMINI, StreamClient([]), streaming=True)
 
 
 def test_gemini_wire_forces_delivery_carries_parameters_and_refuses_others():
