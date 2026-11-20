@@ -4,6 +4,7 @@ set -eu
 remote_name=${1:-origin}
 repo_root=$(git rev-parse --show-toplevel)
 checker="$repo_root/tools/changelog_guard.py"
+identity_checker="$repo_root/tools/push_preflight.py"
 zero_sha=0000000000000000000000000000000000000000
 result=0
 
@@ -32,14 +33,26 @@ run_checker() {
     fi
 }
 
+run_identity() {
+    if [ -n "$python_arg" ]; then
+        "$python_bin" "$python_arg" "$identity_checker" "$remote_name" "$1" --repo "$repo_root"
+    else
+        "$python_bin" "$identity_checker" "$remote_name" "$1" --repo "$repo_root"
+    fi
+}
+
 while read -r local_ref local_sha remote_ref remote_sha; do
+    # A wrapper that forwards an empty stdin (nothing to push) sends one empty line.
+    [ -n "$local_sha" ] && [ "$local_sha" != "$zero_sha" ] || continue
+    # Any push publishes commits, a tag's too, and a public repository keeps a leaked email for good (ADR-072).
+    # The hook cannot ask GitHub whether the repository is public, so it always checks.
+    run_identity "$local_sha" || result=1
     # The branch being updated decides, not the local name: `git push origin HEAD:main` from a detached
     # worktree has local_ref HEAD and must still be checked and watched.
     case "$remote_ref" in
         refs/heads/*) ;;
         *) continue ;;
     esac
-    [ "$local_sha" != "$zero_sha" ] || continue
 
     base_sha=$remote_sha
     if [ "$remote_sha" = "$zero_sha" ] || ! git cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
