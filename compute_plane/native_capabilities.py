@@ -533,8 +533,13 @@ class NativeCapabilities:
                     output['detail'] = exc.detail[:600]
             if isinstance(exc, CommandInterrupted):
                 output['process'] = exc.receipt
+                if exc.partial_output:
+                    output['partial_output'] = exc.partial_output
                 idle = round(exc.receipt['idle_ms'] / 1000) if exc.receipt.get('stalled') is True else None
-                if idle is not None:
+                host_reason = exc.receipt.get('reason') if isinstance(exc.receipt, dict) else None
+                if isinstance(host_reason, str) and host_reason:
+                    output['reason'] = host_reason[:600]
+                elif idle is not None:
                     output['reason'] = f'The process showed no activity (no output, no CPU time) for {idle} seconds and was stopped.'
                 if request.tool_call.name in {'command','verify'}:
                     self._tools.reads.clear(); self._tools.verifications.clear()
@@ -546,9 +551,13 @@ class NativeCapabilities:
                     # and denies network. Termination is proved, but staged
                     # changes may be partial: inspect them, never replay here.
                     status='failed'
-                    output.update(reason='Staged command stopped at its output/time bound; partial changes may remain.'
+                    staged_reason = (
+                        f'Staged command: {host_reason[:500]} Partial changes may remain.'
+                        if isinstance(host_reason, str) and host_reason else
+                        'Staged command stopped at its output/time bound; partial changes may remain.'
                         if idle is None else f'Staged command showed no activity for {idle} seconds and was stopped; '
-                        'partial changes may remain.',
+                        'partial changes may remain.')
+                    output.update(reason=staged_reason,
                         effects_may_be_partial=True,
                         next_action='Inspect the candidate before any correction. Do not replay the command automatically. '
                             'Use bounded output or capture/filter large data; checks and independent review still gate application.')

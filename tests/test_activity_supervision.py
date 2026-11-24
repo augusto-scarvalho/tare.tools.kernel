@@ -116,9 +116,9 @@ def test_invalid_supervision_is_refused_before_a_process_starts(tmp_path, runner
         run(runner, tmp_path, 'pass', timeout=30, **options)
 
 
-def capabilities(tmp_path, seconds=20, **binding):
+def capabilities(tmp_path, seconds=20, mediation=None, **binding):
     root, scratch = tmp_path/'repo', tmp_path/'custody'
-    root.mkdir(); scratch.mkdir()
+    root.mkdir(parents=True, exist_ok=True); scratch.mkdir(parents=True, exist_ok=True)
     ref = BindingRef('work', 'binding', 'owner', 1, 'token')
     control = ExecutionControl(ref, CancellationToken(), time.monotonic()+30)
     tools = NativeCapabilities(session_id='s', binding=ref, repositories={'repo': str(root)}, writable={'repo': ['.']},
@@ -126,7 +126,7 @@ def capabilities(tmp_path, seconds=20, **binding):
         scratch_root=scratch, capabilities=['command', 'verify'], specgraph_edit_context=False)
     class Mediation:
         def execute(self, facts, effect): return effect()
-    tools.bind_command_mediation(Mediation())
+    tools.bind_command_mediation(mediation or Mediation())
     environment = {name: os.environ[name] for name in ('PATH', 'SYSTEMROOT') if name in os.environ}
     tools.bind_command_confinement(subprocess.Popen, environment, seconds, **binding)
     return tools, control
@@ -213,3 +213,96 @@ def test_any_growth_of_cpu_time_is_activity_however_small():
         assert watch.stalled(0) is True
     finally:
         time.monotonic = real
+
+
+@RUNNERS
+def test_current_output_tail_reads_live_stdout_and_stderr_inside_on_progress(tmp_path, runner):
+    assert managed_process.current_output_tail() == ''
+    tails = []
+    code = (
+        'import sys, time\n'
+        'print("OUT_START", flush=True)\n'
+        'print("ERR_NOTE", file=sys.stderr, flush=True)\n'
+        'time.sleep(2.5)\n'
+    )
+
+    def observe(sample):
+        assert set(sample) == {'elapsed_ms', 'idle_ms', 'cpu_ms', 'output_bytes'}
+        if sample['output_bytes'] > 0:
+            tails.append(managed_process.current_output_tail(200))
+        return False
+
+    receipt, _ = run(runner, tmp_path, code, timeout=30, on_progress=observe)
+    assert receipt['exit_code'] == 0 and receipt['progress_failures'] == 0
+    assert tails and any('OUT_START' in t and 'ERR_NOTE' in t for t in tails)
+    assert managed_process.current_output_tail() == ''
+
+
+def test_interrupted_command_returns_partial_output_only_after_verified_cleanup(tmp_path, monkeypatch):
+    busy_with_output = (
+        'import sys, time\n'
+        'print("STEP_1_DONE", flush=True)\n'
+        'print("ERR_MARKER", file=sys.stderr, flush=True)\n'
+        'end = time.monotonic() + 30\n'
+        'while time.monotonic() < end: pass\n'
+    )
+    stopped = []
+
+    def stop_on_output(effect, sample):
+        if sample['output_bytes'] > 0:
+            stopped.append(managed_process.current_output_tail(512))
+            return True
+        return False
+
+    # Mediator attaches a host-formatted reason on the returned process receipt.
+    class HostMediation:
+        def execute(self, facts, effect):
+            proc = effect()
+            return {**proc, 'reason': 'The process produced no new output while using CPU and was stopped after 600 seconds.'}
+
+    tools, control = capabilities(tmp_path / 'plain', seconds=20, mediation=HostMediation(),
+                                  unbounded_command=True, on_progress=stop_on_output)
+    res = call(tools, control, 'command', repository='repo', argv=[sys.executable, '-I', '-c', busy_with_output])
+    out = json.loads(res.output_json)
+    assert res.status == 'unknown' and out['error_type'] == 'CommandInterrupted'
+    assert out['reason'] == 'The process produced no new output while using CPU and was stopped after 600 seconds.'
+    assert 'STEP_1_DONE' in out['partial_output'] and 'ERR_MARKER' in out['partial_output']
+    assert stopped and 'STEP_1_DONE' in stopped[0]
+
+    # Same host reason is preserved under staged_effects=True too.
+    tools_staged, control_staged = capabilities(tmp_path / 'staged', seconds=20, mediation=HostMediation(),
+                                                unbounded_command=True, staged_effects=True, on_progress=stop_on_output)
+    res_s = call(tools_staged, control_staged, 'command', repository='repo', argv=[sys.executable, '-I', '-c', busy_with_output])
+    out_s = json.loads(res_s.output_json)
+    assert res_s.status == 'failed' and out_s['effects_may_be_partial'] is True
+    assert out_s['reason'].startswith('Staged command: The process produced no new output while using CPU')
+    assert 'STEP_1_DONE' in out_s['partial_output']
+
+    # Unverified cleanup or isolation violation must NEVER return partial_output.
+    for idx, fault in enumerate(({'cleanup_verified': False, 'stalled': True, 'idle_ms': 0},
+                                 {'cleanup_verified': True, 'isolation_violation': True})):
+        tools_bad, control_bad = capabilities(tmp_path / f'bad-{idx}', seconds=20)
+        def fake_run(argv, **options):
+            Path(options['dest'], 'stdout.txt').write_bytes(b'SECRET_UNVERIFIED_OUTPUT')
+            Path(options['dest'], 'stderr.txt').write_bytes(b'')
+            return {'exit_code': None, 'cancelled': False, 'timeout': False, 'output_limit': False, **fault}
+        monkeypatch.setattr('compute_plane.managed_process.run_process', fake_run)
+        res_bad = call(tools_bad, control_bad, 'command', repository='repo', argv=['fixture'])
+        out_bad = json.loads(res_bad.output_json)
+        assert res_bad.status == 'unknown' and 'partial_output' not in out_bad
+
+
+def test_read_output_tail_preserves_both_streams_and_enforces_decoded_utf8_cap(tmp_path):
+    (tmp_path / 'stdout.txt').write_bytes(b'LIVE_STDOUT_END\n')
+    (tmp_path / 'stderr.txt').write_bytes(b'W' * 400 + b'OLD_STDERR_END\n')
+    tail = managed_process.read_output_tail(tmp_path, max_bytes=80)
+    assert 'LIVE_STDOUT_END' in tail and 'OLD_STDERR_END' in tail
+    assert len(tail.encode('utf-8')) <= 80
+
+    # Invalid UTF-8 bytes expand to 3-byte U+FFFD on decode; the decoded UTF-8 byte cap must still hold.
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    (bin_dir / 'stdout.txt').write_bytes(b'\xff' * 500)
+    (bin_dir / 'stderr.txt').write_bytes(b'')
+    decoded = managed_process.read_output_tail(bin_dir, max_bytes=64)
+    assert decoded and len(decoded.encode('utf-8')) <= 64
