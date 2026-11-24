@@ -128,6 +128,7 @@ class NativeCapabilities:
         self.session_id, self.binding = session_id, binding
         self._lock, self._control, self._started = Lock(), None, False
         self._seen = set()
+        self._read_lines = {}
         self._refresh_reads = set()
         self.project_context = project_context
         names = type(self).names if role == 'implementer' else ('read', 'list')
@@ -196,6 +197,33 @@ class NativeCapabilities:
                 }
         return encode(specs)
 
+    def _record_read_coverage(self, args, output):
+        """Track covered line intervals for unchanged source reads; return True iff any new line was read, or None for non-line reads."""
+        if 'json_pointer' in args or output.get('partial_line') or not output.get('sha256'):
+            return None
+        start, end = output.get('start'), output.get('end')
+        if type(start) is not int or type(end) is not int or start < 1 or end < start or not output.get('text'):
+            return None
+        key = (args['repository'], args['path'], output['sha256'], self._tools.effects)
+        spans = self._read_lines.get(key, [])
+        if any(lo <= start and end <= hi for lo, hi in spans):
+            return False
+        merged, lo, hi, inserted = [], start, end, False
+        for a, b in spans:
+            if b + 1 < lo:
+                merged.append((a, b))
+            elif hi + 1 < a:
+                if not inserted:
+                    merged.append((lo, hi))
+                    inserted = True
+                merged.append((a, b))
+            else:
+                lo, hi = min(lo, a), max(hi, b)
+        if not inserted:
+            merged.append((lo, hi))
+        self._read_lines[key] = merged
+        return True
+
     def observations(self):
         return object_json(encode({'effects': self._tools.effects, 'reads': self._tools.reads,
                                   'verifications': self._tools.verifications,
@@ -243,6 +271,8 @@ class NativeCapabilities:
                     expected[key] = (args['repository'], args['path'], output.get('sha256'), record.sequence)
                 self._seen.add(encode({'name': name, 'args': args, 'effects': self._tools.effects,
                     'output': {k: v for k, v in output.items() if k != 'process'}}))
+                if name == 'read':
+                    self._record_read_coverage(args, output)
         if unfinished:
             return  # Runtime reports reconciliation before any next invocation.
         changes = []
@@ -513,7 +543,9 @@ class NativeCapabilities:
                                   'output': {k: v for k, v in output.items() if k != 'process'}})
             # A search or context lookup that finds nothing is news the first time: a session that starts on red
             # tests and looks for what does not exist yet is working; only repeating what it saw is not.
-            progressed = status == 'succeeded' and observation not in self._seen
+            # For line-based reads of an unchanged file, shifting start/end across already-read lines is not progress.
+            read_new = self._record_read_coverage(args, output) if (name == 'read' and status == 'succeeded') else None
+            progressed = status == 'succeeded' and (read_new if read_new is not None else observation not in self._seen)
             self._seen.add(observation)
             return EffectResult(request.effect_id, status, encode(output), progressed)
         except Exception as exc:

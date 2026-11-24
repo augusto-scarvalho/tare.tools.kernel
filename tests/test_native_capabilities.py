@@ -138,6 +138,68 @@ def test_repeated_read_is_not_new_progress(setup):
     assert result.status == 'succeeded' and not result.progressed
 
 
+def test_shifted_overlapping_rereads_of_unchanged_lines_are_not_progress_and_survive_restore(tmp_path):
+    from compute_plane.native_journal import NativeJournal
+    root, scratch = tmp_path / 'repo', tmp_path / 'custody'
+    root.mkdir(); scratch.mkdir()
+    (root / 'big.py').write_text(''.join(f'line_{i} = {i}\n' for i in range(1, 201)), encoding='utf-8')
+    (root / 'wide.txt').write_text('w' * 30000 + '\n', encoding='utf-8')
+    binding = BindingRef('work', 'binding', 'owner', 1, 'token')
+    control = ExecutionControl(binding, CancellationToken(), time.monotonic() + 20)
+
+    def make_tools():
+        return NativeCapabilities(
+            session_id='s', binding=binding, repositories={'repo': str(root)},
+            writable={'repo': ['big.py']}, verifiers={}, scratch_root=scratch, specgraph_edit_context=False,
+        )
+
+    tools = make_tools()
+    journal = NativeJournal(tmp_path / 'journal.jsonl')
+    journal.append({'kind': 'session_started'})
+
+    def tracked_call(idx, name, **args):
+        tc = ToolCall(f'c{idx}', name, json.dumps(args))
+        eid = f's/effect/{idx}'
+        journal.append({'kind': 'effect_requested', 'effect_id': eid, 'tool_call': {
+            'call_id': tc.call_id, 'name': tc.name, 'arguments_json': tc.arguments_json}})
+        res = tools.execute(EffectRequest('s', eid, tc), control)
+        journal.append({'kind': 'effect_returned', 'result': {
+            'effect_id': res.effect_id, 'status': res.status,
+            'output_json': res.output_json, 'progressed': res.progressed}})
+        return res
+
+    # Reading contiguous chunks progresses; shifting start/end inside already-covered lines does not.
+    r1 = tracked_call(1, 'read', repository='repo', path='big.py', start=1, end=60)
+    r2 = tracked_call(2, 'read', repository='repo', path='big.py', start=61, end=120)
+    r3 = tracked_call(3, 'read', repository='repo', path='big.py', start=30, end=90)
+    r4 = tracked_call(4, 'read', repository='repo', path='big.py', start=1, end=120)
+    r5 = tracked_call(5, 'read', repository='repo', path='big.py', start=100, end=150)
+    r6 = tracked_call(6, 'read', repository='repo', path='big.py', start=80, end=140)
+    assert r1.progressed and r2.progressed
+    assert not r3.progressed and not r4.progressed
+    assert r5.progressed and not r6.progressed
+
+    # Long-line column pagination (partial_line=True) still progresses on each new column slice.
+    w1 = tracked_call(7, 'read', repository='repo', path='wide.txt', start=1, end=1)
+    w1_out = json.loads(w1.output_json)
+    assert w1.progressed and w1_out['partial_line']
+    w2 = tracked_call(8, 'read', repository='repo', path='wide.txt', start=1, end=1, start_column=w1_out['end_column'] + 1)
+    assert w2.progressed
+
+    # Restoring from journal preserves covered line spans so shifted re-reads stay non-progressing.
+    restored = make_tools()
+    restored.restore(journal)
+    assert not call(restored, control, 'read', repository='repo', path='big.py', start=20, end=145).progressed
+    assert call(restored, control, 'read', repository='repo', path='big.py', start=140, end=170).progressed
+
+    # Editing the file changes sha256/effects, so reading the modified lines progresses again.
+    sha = json.loads(r1.output_json)['sha256']
+    edited = call(restored, control, 'edit', repository='repo', path='big.py', sha256=sha,
+                  search='line_1 = 1', replace='line_1 = 999')
+    assert edited.status == 'succeeded' and edited.progressed
+    assert call(restored, control, 'read', repository='repo', path='big.py', start=1, end=60).progressed
+
+
 def test_read_after_own_edit_and_verification_preserves_receipt_but_external_change_clears_it(setup):
     root, _, tools, control = setup
     read = call(tools, control, 'read', repository='repo', path='a.py')
