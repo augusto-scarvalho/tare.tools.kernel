@@ -194,7 +194,7 @@ class MediatedTools:
             result = SpecGraphFirstGate().evaluate(call)
             if result.decision is ToolDecision.DENY:
                 raise ValueError(result.reason)
-        from .managed_process import run_process
+        from .managed_process import read_output_tail, run_process
         from .command_mediation import CommandFacts, environment_digest, invoke
         # Freeze the executed argv and environment before consulting advisory ports.
         argv = tuple(argv)
@@ -233,10 +233,14 @@ class MediatedTools:
                 process = invoke(self.command_mediation, facts, effect)
             if (not process["cleanup_verified"] or process["cancelled"] or process["timeout"]
                     or process.get('stalled') or process.get('isolation_violation')):
-                raise CommandInterrupted(process)
+                tail = (read_output_tail(temporary, min(output_bytes, 8192))
+                        if process.get('cleanup_verified') is True and not process.get('isolation_violation') else '')
+                raise CommandInterrupted(process, partial_output=tail)
             if process['output_limit']:
                 if not partial_read:
-                    raise CommandInterrupted(process)
+                    tail = (read_output_tail(temporary, min(output_bytes, 8192))
+                            if process.get('cleanup_verified') is True and not process.get('isolation_violation') else '')
+                    raise CommandInterrupted(process, partial_output=tail)
                 # Only a trusted read-only caller may consume a captured prefix,
                 # after proved cleanup. Stderr is never filename inventory.
                 with (Path(temporary)/'stdout.txt').open('rb') as stream:
@@ -511,7 +515,11 @@ class MediatedTools:
 
 
 class CommandInterrupted(OSError):
-    def __init__(self, receipt):
-        super().__init__(f"command_stalled: no activity for {round(receipt['idle_ms'] / 1000)} seconds"
-                         if receipt.get('stalled') is True else "command_interrupted_or_cleanup_unverified")
+    def __init__(self, receipt, partial_output=''):
+        reason = receipt.get('reason') if isinstance(receipt, dict) else None
+        super().__init__(
+            reason if isinstance(reason, str) and reason else
+            f"command_stalled: no activity for {round(receipt['idle_ms'] / 1000)} seconds"
+            if receipt.get('stalled') is True else "command_interrupted_or_cleanup_unverified")
         self.receipt = receipt
+        self.partial_output = partial_output if isinstance(partial_output, str) else ''

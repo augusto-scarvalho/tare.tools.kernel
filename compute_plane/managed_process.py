@@ -7,6 +7,7 @@ Output goes to files so a descendant holding a pipe cannot stall communicate().
 """
 from __future__ import annotations
 
+from contextvars import ContextVar
 import os
 from pathlib import Path
 import re
@@ -17,6 +18,83 @@ from threading import Thread, Event
 import time
 
 ACTIVITY_SAMPLE_SECONDS = 1.0
+_OUTPUT_TAIL: ContextVar = ContextVar('managed_process_output_tail', default=None)
+
+
+def _read_file_tail(path, max_bytes):
+    """Read at most the last `max_bytes` bytes of a file that may still be open for writing."""
+    try:
+        with Path(path).open('rb') as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            if size <= 0:
+                return b''
+            stream.seek(max(0, size - max_bytes))
+            return stream.read(max_bytes)
+    except OSError:
+        return b''
+
+
+def _trim_utf8_tail(text, max_bytes):
+    """Keep the longest suffix of `text` whose UTF-8 encoding is at most `max_bytes` bytes."""
+    if len(text.encode('utf-8')) <= max_bytes:
+        return text
+    out, used = [], 0
+    for ch in reversed(text):
+        size = len(ch.encode('utf-8'))
+        if used + size > max_bytes:
+            break
+        out.append(ch)
+        used += size
+    out.reverse()
+    return ''.join(out)
+
+
+def _combine_tail(out, err, max_bytes):
+    """Combine bounded tails of stdout and stderr without letting a stale or binary stream starve the other."""
+    limit = max(1, min(int(max_bytes), 65536))
+    if out and err:
+        if limit == 1:
+            return _trim_utf8_tail(err.decode('utf-8', errors='replace'), 1)
+        out_text = out.decode('utf-8', errors='replace')
+        err_text = err.decode('utf-8', errors='replace')
+        out_len = len(out_text.encode('utf-8'))
+        err_len = len(err_text.encode('utf-8'))
+        sep = '' if out_text.endswith(('\n', '\r')) else '\n'
+        sep_len = len(sep)
+        if out_len + sep_len + err_len > limit:
+            avail = max(1, limit - sep_len)
+            half = max(1, avail // 2)
+            if err_len <= half:
+                out_text = _trim_utf8_tail(out_text, max(0, avail - err_len))
+            elif out_len <= half:
+                err_text = _trim_utf8_tail(err_text, max(0, avail - out_len))
+            else:
+                out_text = _trim_utf8_tail(out_text, max(1, avail - half))
+                err_text = _trim_utf8_tail(err_text, half)
+        return _trim_utf8_tail(out_text + (sep if out_text and err_text else '') + err_text, limit)
+    return _trim_utf8_tail((out or err).decode('utf-8', errors='replace'), limit)
+
+
+def read_output_tail(directory, max_bytes=4096):
+    """Bounded UTF-8 tail of stdout.txt + stderr.txt inside a managed process output directory."""
+    limit = max(1, min(int(max_bytes), 65536))
+    folder = Path(directory)
+    out = _read_file_tail(folder / 'stdout.txt', limit)
+    err = _read_file_tail(folder / 'stderr.txt', limit)
+    return _combine_tail(out, err, limit)
+
+
+def current_output_tail(max_bytes=4096):
+    """Read a bounded tail of the currently observed process's output from inside an on_progress callback."""
+    reader = _OUTPUT_TAIL.get()
+    if reader is None:
+        return ''
+    limit = max(1, min(int(max_bytes), 65536))
+    try:
+        return reader(limit)
+    except Exception:
+        return ''
 
 
 def host_executable(name, *, required=False):
@@ -320,8 +398,8 @@ class _Activity:
             raise ValueError('positive idle_timeout and callable on_progress required')
         self.idle_timeout, self.on_progress = idle_timeout, on_progress
 
-    def start(self, result, read_cpu):
-        self.result, self.read_cpu = result, read_cpu
+    def start(self, result, read_cpu, read_tail=None):
+        self.result, self.read_cpu, self.read_tail = result, read_cpu, read_tail
         self.started = self.sampled = self.active_at = time.monotonic()
         self.cpu = read_cpu()
         self.measured = self.cpu is not None
@@ -351,6 +429,7 @@ class _Activity:
             return False
         self.sample(output, now)
         if self.on_progress is not None:
+            token = _OUTPUT_TAIL.set(self.read_tail)
             try:
                 # A host that asks someone before stopping a silent tree gives no idle_timeout and answers here:
                 # exactly True stops the tree now, as a stall (the tree keeps running while the host decides).
@@ -360,6 +439,8 @@ class _Activity:
                     return True
             except Exception:
                 self.result['progress_failures'] += 1
+            finally:
+                _OUTPUT_TAIL.reset(token)
         return self.measured and self.idle_timeout is not None and now - self.active_at >= self.idle_timeout
 
 
@@ -394,7 +475,8 @@ def run_process(argv, *, cwd, dest, timeout, env=None, stdin=b'', cancelled=lamb
                 **({'creationflags': 0x4} if job else {'start_new_session': True}))
             result['pid'] = proc.pid
             if activity:
-                activity.start(result, lambda: _tree_cpu_ms(job, proc.pid))
+                activity.start(result, lambda: _tree_cpu_ms(job, proc.pid),
+                               read_tail=lambda limit: read_output_tail(dest, limit))
             confinement = getattr(proc, 'confinement_receipt', None)
             if confinement is not None:
                 result['confinement'] = dict(confinement)
@@ -499,7 +581,9 @@ def run_pipe_process(argv, *, cwd, timeout, stdin=b'', cancelled=lambda: False,
             **({'creationflags': 0x4} if job else {'start_new_session': True}))
         result.update(started=True, pid=proc.pid)
         if activity:
-            activity.start(result, lambda: _tree_cpu_ms(job, proc.pid))
+            def pipe_tail(limit):
+                return _combine_tail(bytes(buffers[0][-limit:]), bytes(buffers[1][-limit:]), limit)
+            activity.start(result, lambda: _tree_cpu_ms(job, proc.pid), read_tail=pipe_tail)
         if job:
             job.assign_and_resume(proc)
         source = proc.stdin
