@@ -2,6 +2,10 @@
 import json
 from pathlib import PurePosixPath
 
+DEFAULT_MAX_BYTES = 8192
+WORKING_SOURCE_MAX_BYTES = 16384
+WORKING_SOURCE_MAX_EXCERPTS = 8
+
 
 def operational_checkpoint(snapshot, *, writable=None):
     from .native_terminal import MUTATIONS
@@ -114,7 +118,8 @@ def operational_checkpoint(snapshot, *, writable=None):
     rows = rows[-12:]
     sources = sorted(read_sources.values(), key=lambda row: row['receipt']['sequence'])[-12:]
     excerpts = sorted([r for ranges in working_reads.values() for r in ranges.values()],
-                      key=lambda row: row['receipt']['sequence'])[-4:]
+                      key=lambda row: row['receipt']['sequence'])[-WORKING_SOURCE_MAX_EXCERPTS:]
+    budget = WORKING_SOURCE_MAX_BYTES if excerpts else DEFAULT_MAX_BYTES
     while True:
         value = {'basis': 'Recorded tool receipts, not model claims or a fresh filesystem check. '
             'Successful edits attest application, not correctness. Verification applies only to its '
@@ -131,7 +136,7 @@ def operational_checkpoint(snapshot, *, writable=None):
                 'Reuse matching source context; read only missing ranges needed for the next edit. '
                 'Do not restart repository discovery after compaction. File hashes still guard edits.')
         text = json.dumps(value, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
-        if len(text.encode()) <= 8192:
+        if len(text.encode()) <= budget:
             if instructions:
                 value['scoped_project_instructions'] = [instructions[key] for key in sorted(instructions)]
                 value['instruction_scope'] = ('Project guidance applies only inside each AGENTS.md directory; '
