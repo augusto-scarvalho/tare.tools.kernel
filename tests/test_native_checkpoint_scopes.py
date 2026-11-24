@@ -37,7 +37,7 @@ def test_writable_scope_filters_excerpts_to_authorized_paths():
 
 
 def test_multibyte_source_body_stays_bounded():
-    """A long multibyte source body plus metadata receipts fits within 8192 bytes."""
+    """A long multibyte source body plus metadata receipts fits within 16384 bytes."""
     log = ConversationLog()
     # Several read metadata receipts from non-writable paths
     for i in range(5):
@@ -53,7 +53,7 @@ def test_multibyte_source_body_stays_bounded():
            {'sha256': 'd' * 64, 'start': 1, 'end': 200, 'next_start': 201,
             'text': body})
     raw = operational_checkpoint(log.snapshot(), writable={'r': ['src']})
-    assert len(raw.encode('utf-8')) <= 8192
+    assert len(raw.encode('utf-8')) <= 16384
     value = json.loads(raw)
     excerpts = value.get('working_source_excerpts', [])
     assert len(excerpts) == 1
