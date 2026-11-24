@@ -95,13 +95,32 @@ def test_working_source_payload_stays_bounded_and_default_keeps_metadata_only():
     for i in range(10):
         record(log, 'read', {'repository':'r','path':f'src/{i}.py'},
             {'sha256':'a'*64, 'start':1, 'end':200, 'text':'1: source line\n'*2000})
-    assert 'working_source_excerpts' not in json.loads(operational_checkpoint(log.snapshot()))
+    default_raw = operational_checkpoint(log.snapshot())
+    assert len(default_raw.encode()) <= 8192
+    assert 'working_source_excerpts' not in json.loads(default_raw)
     raw = operational_checkpoint(log.snapshot(), writable={'r':['src']})
     value = json.loads(raw)
-    assert len(raw.encode()) <= 8192
+    assert 8192 < len(raw.encode()) <= 16384
     assert value['working_source_excerpts']
     assert all(r['excerpt_only'] for r in value['working_source_excerpts'])
     assert value['working_source_excerpts'][-1]['path'] == 'src/9.py'
+
+
+def test_working_source_checkpoint_retains_up_to_eight_recent_excerpts_within_16k():
+    log = ConversationLog()
+    for i in range(6):
+        chunk = f'{i * 60 + 1}: ' + ('x' * 55 + '\n') * 30
+        record(log, 'read', {'repository':'r','path':'src/hub.gd'},
+            {'sha256':'a'*64, 'start':i * 60 + 1, 'end':(i + 1) * 60, 'next_start':(i + 1) * 60 + 1, 'text':chunk})
+    raw = operational_checkpoint(log.snapshot(), writable={'r':['src/hub.gd']})
+    value = json.loads(raw)
+    assert 8192 < len(raw.encode()) <= 16384
+    assert [r['start'] for r in value['working_source_excerpts']] == [1, 61, 121, 181, 241, 301]
+    assert all(not r['excerpt_only'] for r in value['working_source_excerpts'])
+    # Empty writable scopes keep the 8 KiB default metadata-only budget.
+    for i in range(20):
+        record(log, 'read', {'repository':'r','path':f'ro/{i}_' + 'y' * 600}, {'sha256':'b'*64})
+    assert len(operational_checkpoint(log.snapshot(), writable={'r':[]}).encode()) <= 8192
 
 
 def test_terminal_receipts_keep_real_exit_and_invalidate_named_verification():
