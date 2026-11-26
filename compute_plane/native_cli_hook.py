@@ -17,6 +17,7 @@ def main():
                           'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'permissionDecision': 'deny',
                                                  'permissionDecisionReason': 'Tare executes this action.'}}))
         return
+    allow_finish = '--allow-finish' in sys.argv[3:]
     row = {'phase': phase, 'model': event.get('modelName'),
            'invocation': event.get('invocationNum'), 'termination': event.get('terminationReason'),
            'tool': event.get('toolCall', {}).get('name') if phase == 'tool' else None}
@@ -29,9 +30,12 @@ def main():
                 and {'text', 'actions'} <= args.keys()
                 and not args.keys() - {'text', 'actions', 'toolAction', 'toolSummary'}):
             row['proposal'] = {key: args[key] for key in ('text', 'actions')}
+            if allow_finish:
+                row['decision'] = 'allow'
     with target.open('a', encoding='utf-8') as stream:
         stream.write(json.dumps(row)+'\n')
     result = ({'terminationBehavior': 'terminate'} if phase == 'post' else
+              {'decision': 'allow'} if phase == 'tool' and row.get('decision') == 'allow' else
               {'decision': 'deny', 'reason': 'Tare owns tool execution.'} if phase == 'tool' else
               {'decision': 'stop'} if phase == 'stop' else {})
     print(json.dumps(result))

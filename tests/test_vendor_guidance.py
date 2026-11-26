@@ -91,7 +91,8 @@ def fingerprint(seen):
 
 # Recorded from the adapter before vendor guidance existed (Kernel cf63a03): with no saved choice every CLI must
 # keep receiving exactly these bytes.
-BEFORE = {'agy': '3dae06ce2c95d5ac02456be7a0c4abefa84e47d1449b5db86cef907e76922d96',
+# 0.9.101: AGY_ACTION_GUIDANCE replaced the soft "60 lines" line with mechanical page-limit wording (before: 3dae06ce...).
+BEFORE = {'agy': '768659519ffe4047b7e032c33e6f4641b6e8a6f65b4b6e6157672c420c10b4ab',
           'claude-native': '856e71e6797bdf96c8f470fb3946e66316c7024707637a860f9bc8c1003b0694',
           'claude-plain': '3ff2f1e8baa5e93f595d887e7d9085d545a9624c9219465f450143599da35e5d',
           'claude-structured': '9acec21e03908e2c9d814362b06a713fd3e7ebff206ecfb03e26a5a1c2876a72',

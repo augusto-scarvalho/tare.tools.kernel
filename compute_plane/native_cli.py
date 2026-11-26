@@ -5,6 +5,7 @@ and are reported as unknown, never counted as a single backend HTTP request.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -15,10 +16,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import weakref
 
 from tare_tools_agent_runtime import ConversationRejected, ModelFailure
 from .managed_process import run_pipe_process
-from .native_models import encode, INVALID_CLI_REPLY, object_json, NativeTransportInterrupted
+from .native_models import encode, INVALID_CLI_REPLY, MAX_REQUEST_BYTES, object_json, NativeTransportInterrupted
 from .native_counting import input_tokens
 
 INSTRUCTIONS = (
@@ -78,7 +80,7 @@ HAIKU_SEARCH_GUIDANCE = (
 AGY_ACTION_GUIDANCE = (
     'Return only the next external decision. The action_catalog describes actions for Tare, not '
     'native execution. Return at most 4 independent actions per decision. '
-    'Read small necessary ranges, normally at most 60 lines per read. '
+    'Read only the necessary ranges within the tool\'s page limits. '
     'An audit can take multiple decisions. Wait for those results before proposing further reads '
     'or checks; do not turn the entire audit checklist into one oversized batch. These are not '
     'native tools available in this CLI. In particular, do not call read or search here. '
@@ -103,6 +105,35 @@ AGY_SONNET_GUIDANCE = (
 # user-request truncation. The exact vendor cap is unmeasured. Never trim input.
 AGY_REQUEST_BYTE_LIMIT = 160 * 1024
 AGY_MAX_ACTIONS = 4
+_AGY_USAGE_INT_KEYS = ('input_tokens', 'output_tokens', 'thinking_tokens', 'cache_read_tokens', 'total_tokens')
+
+
+def _sha_text(text: str) -> str:
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def _agy_conversation_id(rows) -> str | None:
+    for row in rows:
+        if isinstance(row.get('conversation_id'), str) and row['conversation_id']:
+            return row['conversation_id']
+        res = row.get('result')
+        if isinstance(res, dict) and isinstance(res.get('conversation_id'), str) and res['conversation_id']:
+            return res['conversation_id']
+    return None
+
+
+def _agy_usage_delta(current, previous):
+    """Subtract cumulative AGY conversation usage to obtain the current turn's exclusive usage."""
+    if not isinstance(current, dict) or not isinstance(previous, dict):
+        return current, False
+    delta = dict(current)
+    for key in _AGY_USAGE_INT_KEYS:
+        cur_val, prev_val = current.get(key), previous.get(key)
+        if type(cur_val) is int and type(prev_val) is int:
+            if cur_val < prev_val:
+                return current, False
+            delta[key] = cur_val - prev_val
+    return delta, True
 
 # How each vendor CLI says its account has no usage left (Claude Code, Codex, AGY), read only on failure paths.
 USAGE_LIMIT_TEXT = re.compile(r"hit your (?:usage )?limit|usage limit (?:reached|exceeded)|exhausted your quota"
@@ -412,11 +443,11 @@ def _command(argv):
     return subprocess.list2cmdline(argv) if os.name == 'nt' else shlex.join(argv)
 
 
-def prepare_agy(root, system):
+def prepare_agy(root, system, *, allow_finish=False):
     agent = root/'.agents/agents/tare-inference/agent.md'
-    agent.parent.mkdir(parents=True)
+    agent.parent.mkdir(parents=True, exist_ok=True)
     plugin = root/'.agents/plugins/tare-inference'
-    plugin.mkdir(parents=True)
+    plugin.mkdir(parents=True, exist_ok=True)
     (plugin/'plugin.json').write_text(encode({'name': 'tare-inference',
         'description': 'Return control to Tare after one inference.'}), encoding='utf-8')
     agent.write_text('---\nname: tare-inference\ndescription: Tare inference boundary.\n'
@@ -427,7 +458,8 @@ def prepare_agy(root, system):
         encoding='utf-8')
     hook = Path(__file__).with_name('native_cli_hook.py').resolve()
     def command(phase):
-        return _command([sys.executable, '-I', str(hook), str(root/'boundary.jsonl'), phase])
+        extra = ['--allow-finish'] if phase == 'tool' and allow_finish else []
+        return _command([sys.executable, '-I', str(hook), str(root/'boundary.jsonl'), phase, *extra])
     hooks = {'tare-inference': {
         'PreInvocation': [{'command': command('pre')}],
         'PostInvocation': [{'command': command('post')}],
@@ -436,9 +468,9 @@ def prepare_agy(root, system):
     (plugin/'hooks.json').write_text(encode(hooks), encoding='utf-8')
 
 
-def agy_invocation(executable, root, body, timeout):
+def agy_invocation(executable, root, body, timeout, *, resume_id=None, delta_prompt=None, allow_finish=False):
     """Tare's AGY command for one request: (argv, stdin text). The agent and its boundary plugin go under root."""
-    prepare_agy(root, body['system'])
+    prepare_agy(root, body['system'], allow_finish=allow_finish)
     argv = [executable, '--add-dir', str(root), '--agent', 'tare-inference',
             '--model', body['model'], '--effort', body['effort'],
             '--disable-slash-commands', '--print-timeout',  # 0s: AGY waits until the turn completes
@@ -446,7 +478,10 @@ def agy_invocation(executable, root, body, timeout):
             '--output-format', 'stream-json', '--input-format', 'stream-json']
     if 'response_schema' in body:
         argv += ['--json-schema', encode(body['response_schema'])]
-    return argv, encode({'event': 'user', 'message': {'content': body['prompt'] + body.get('reminder', '')}})+'\n'
+    if resume_id:
+        argv += ['--resume', resume_id]
+    prompt_text = delta_prompt if delta_prompt is not None else body['prompt']
+    return argv, encode({'event': 'user', 'message': {'content': prompt_text + body.get('reminder', '')}})+'\n'
 
 
 def action_proposal(value, model, usage):
@@ -504,8 +539,8 @@ AGY_PROTOCOL_COMPLETION = 1
 
 class AgyCompletion:
     """Observe a full terminal reply; the final decoder still validates drained output."""
-    def __init__(self, root, model, structured):
-        self.root, self.model, self.structured = root, model, structured
+    def __init__(self, root, model, structured, *, allow_finish=False):
+        self.root, self.model, self.structured, self.allow_finish = root, model, structured, allow_finish
         self.raw = bytearray()
         self.previous = None
 
@@ -524,13 +559,13 @@ class AgyCompletion:
             self.previous = identity
             rows = [object_json(line) for line in bytes(self.raw).splitlines() if line.strip()]
             hooks = [object_json(line) for line in path.read_bytes().splitlines() if line.strip()]
-            decode_agy(rows, hooks, self.model, structured=self.structured)
+            decode_agy(rows, hooks, self.model, structured=self.structured, allow_finish=self.allow_finish)
             return True
         except (OSError, ValueError, TypeError, KeyError, ModelFailure, ConversationRejected):
             return False
 
 
-def decode_agy(rows, hooks, model, *, structured=False):
+def decode_agy(rows, hooks, model, *, structured=False, allow_finish=False):
     # A spent quota ends the run early (no post hook), so it is read before the boundary checks; only from a
     # failed result or an error event, never from an answer that merely mentions quotas.
     spent = [text for text in (json.dumps(r, ensure_ascii=False) if r.get('event') == 'error' else
@@ -545,8 +580,10 @@ def decode_agy(rows, hooks, model, *, structured=False):
         raise usage_limit(time.time()+seconds if seconds else None,
                           'model' if AGY_MODEL_QUOTA.search(spent[-1]) else None)
     phases = [h['phase'] for h in hooks]
+    allowed_decisions = {'deny', 'allow'} if allow_finish else {'deny'}
     final_action = (structured and phases == ['pre', 'tool', 'post', 'stop']
-                    and hooks[1].get('tool') == 'finish' and hooks[1].get('decision') == 'deny'
+                    and hooks[1].get('tool') == 'finish'
+                    and hooks[1].get('decision') in allowed_decisions
                     and isinstance(hooks[1].get('proposal'), dict))
     if (phases != ['pre', 'post', 'stop'] and not final_action
             or any(h['model'] != model for h in hooks)):
@@ -844,6 +881,65 @@ class VendorCliClient:
         self.qualification = {} if qualification is None else qualification
         self._probing, self._passed = set(), set()  # _passed: this session's verdicts, whatever the store
         self._codex_features = {}
+        self._agy_resume = None  # Ephemeral per-client delta cursor; journal.jsonl remains source of truth.
+        self._agy_resume_supported = {}
+        self._agy_tempdir = None
+        self._agy_tempdir_finalizer = None
+
+    def _reset_agy_resume(self):
+        self._agy_resume = None
+        fin, self._agy_tempdir_finalizer = self._agy_tempdir_finalizer, None
+        self._agy_tempdir = None
+        if fin is not None:
+            try:
+                fin()
+            except OSError:
+                pass
+
+    def _agy_stable_root(self):
+        if self._agy_tempdir is None:
+            td = tempfile.TemporaryDirectory(prefix='tare-inference-')
+            self._agy_tempdir = td
+            self._agy_tempdir_finalizer = weakref.finalize(self, td.cleanup)
+        root = Path(self._agy_tempdir.name)
+        boundary = root / 'boundary.jsonl'
+        if boundary.exists():
+            boundary.unlink()
+        return root
+
+    def close(self):
+        self._reset_agy_resume()
+
+    def _agy_resume_plan(self, body):
+        """Return delta-resume plan when body strictly appends to the live AGY conversation cursor, else None."""
+        cursor = self._agy_resume
+        if (cursor is None or self.endpoint != 'cli://agy' or 'response_schema' not in body
+                or body.get('purpose') == 'summary' or self._probing):
+            return None
+        try:
+            envelope = object_json(body['prompt'], max_bytes=MAX_REQUEST_BYTES)
+        except (ValueError, TypeError, KeyError, ConversationRejected):
+            return None
+        records = envelope.get('conversation_records')
+        if not isinstance(records, list):
+            return None
+        if (body.get('model') != cursor['model'] or body.get('effort') != cursor['effort']
+                or _sha_text(body['system']) != cursor['system_sha']
+                or _sha_text(encode(body['response_schema'])) != cursor['schema_sha']
+                or _sha_text(encode(envelope.get('action_catalog', []))) != cursor['catalog_sha']):
+            return None
+        prev_hashes = cursor['record_hashes']
+        if len(records) <= len(prev_hashes):
+            return None
+        cur_hashes = [_sha_text(encode(rec)) for rec in records]
+        if cur_hashes[:len(prev_hashes)] != prev_hashes:
+            return None
+        delta_records = records[len(prev_hashes):]
+        delta_obj = {'continuation_of_earlier_records': True, 'new_conversation_records': delta_records}
+        if 'turn_constraints' in envelope:
+            delta_obj['turn_constraints'] = envelope['turn_constraints']
+        return {'cursor': cursor, 'envelope': envelope, 'record_hashes': cur_hashes,
+                'delta_records': delta_records, 'delta_prompt': encode(delta_obj)}
 
     def post(self, path, body, control):
         return self.post_observed(path, body, control)[0]
@@ -947,7 +1043,9 @@ class VendorCliClient:
                    'task_tools_executed': None}
         if control.should_stop():
             raise NativeTransportInterrupted('CLI_CANCELLED', receipt)
-        request_bytes = len(encode(body).encode('utf-8'))
+        resumed = self._agy_resume_plan(body)
+        wire_body = {**body, 'prompt': resumed['delta_prompt']} if resumed is not None else body
+        request_bytes = len(encode(wire_body).encode('utf-8'))
         receipt.update(request_bytes=request_bytes, request_byte_limit=self.request_byte_limit)
         if request_bytes > self.request_byte_limit:
             failure = ModelFailure('CLI_INPUT_BYTE_LIMIT_EXCEEDED' if self.endpoint == 'cli://agy'
@@ -956,8 +1054,13 @@ class VendorCliClient:
                 'request_byte_limit': self.request_byte_limit}
             raise failure
         timeout = min(self.timeout_seconds, control.remaining_seconds())
-        with tempfile.TemporaryDirectory(prefix='tare-inference-') as directory:
-            root = Path(directory)
+        use_stable_agy = (self.endpoint == 'cli://agy' and 'response_schema' in body
+                          and body.get('purpose') != 'summary' and not self._probing)
+        if use_stable_agy and resumed is None:
+            self._reset_agy_resume()
+        ephemeral_dir = None if use_stable_agy else tempfile.TemporaryDirectory(prefix='tare-inference-')
+        try:
+            root = self._agy_stable_root() if use_stable_agy else Path(ephemeral_dir.name)
             try:
                 physical, raw, _ = run_pipe_process([self.executable, '--version'], cwd=root,
                     timeout=min(10, timeout), cancelled=control.should_stop, max_output=8192)
@@ -1012,6 +1115,8 @@ class VendorCliClient:
                             or any(probe.get(key) for key in ('cancelled', 'timeout', 'output_limit'))):
                         receipt['missing_cli_switches'] = missing
                         raise ModelFailure('CLI_CAPABILITY_UNAVAILABLE', not_started=True)
+                    if self.endpoint == 'cli://agy':
+                        self._agy_resume_supported[actual] = '--resume' in switches
                     self._checked_versions.add(actual)
                 key = actual + ' ' + str(body.get('model'))  # per release and model: one model's slip is not all
                 record = self.qualification.get(key) if actual not in self._reference else {'status': 'ok'}
@@ -1027,8 +1132,27 @@ class VendorCliClient:
                         self._codex_features[actual] = discover(self.executable, root, control, run_pipe_process, receipt)
                     receipt['cli_feature_count'] = len(self._codex_features[actual])
                 env = cli_env()
+                agy_allow_finish = False
                 if self.endpoint == 'cli://agy':
-                    argv, source = agy_invocation(self.executable, root, body, timeout)
+                    agy_can_resume = bool(self._agy_resume_supported.get(actual, False))
+                    if resumed is not None and not agy_can_resume:
+                        self._reset_agy_resume()
+                        resumed = None
+                        full_bytes = len(encode(body).encode('utf-8'))
+                        receipt['request_bytes'] = full_bytes
+                        if full_bytes > self.request_byte_limit:
+                            failure = ModelFailure('CLI_INPUT_BYTE_LIMIT_EXCEEDED', not_started=True)
+                            failure.transport_observation = {**receipt, 'request_bytes': full_bytes,
+                                'request_byte_limit': self.request_byte_limit}
+                            raise failure
+                    agy_allow_finish = bool(agy_can_resume and 'response_schema' in body
+                                            and body.get('purpose') != 'summary' and not self._probing)
+                    argv, source = agy_invocation(
+                        self.executable, root, body, timeout,
+                        resume_id=resumed['cursor']['conv_id'] if resumed is not None else None,
+                        delta_prompt=resumed['delta_prompt'] if resumed is not None else None,
+                        allow_finish=agy_allow_finish,
+                    )
                 elif self.endpoint == 'cli://claude':
                     argv, source, turned_on = claude_invocation(self.executable, root, body, env,
                                                                 self.vendor_guidance)
@@ -1053,7 +1177,8 @@ class VendorCliClient:
                                                     guidance=self.vendor_guidance)]
                     source = body['prompt']
                 try:
-                    completion = (AgyCompletion(root, body['model'], 'response_schema' in body)
+                    completion = (AgyCompletion(root, body['model'], 'response_schema' in body,
+                                                allow_finish=agy_allow_finish)
                                   if self.endpoint == 'cli://agy' else None)
                     silence = (_Silence(self.silence_seconds, errors=ERROR_REPORTS.get(self.endpoint, ()),
                                         quiet=self.endpoint == 'cli://agy')
@@ -1085,14 +1210,16 @@ class VendorCliClient:
                     hooks = [object_json(line) for line in hook_file.read_bytes().splitlines()] if hook_file.exists() else []
                     receipt['hook_phases'] = [h['phase'] for h in hooks]
                     receipt['blocked_tool_names'] = [h['tool'] for h in hooks
-                        if h.get('phase') == 'tool' and isinstance(h.get('tool'), str)]
+                        if h.get('phase') == 'tool' and h.get('decision', 'deny') == 'deny'
+                        and isinstance(h.get('tool'), str)]
                     known = {'finish', 'read', 'search', 'list', 'edit', 'verify', 'command', 'tare_deliver'}
                     tools = [r['step_update']['tool_info'] for r in rows if r.get('event') == 'step_update'
                              and isinstance(r.get('step_update'), dict) and r['step_update'].get('tool_info')]
                     receipt['step_tool_names'] = sorted({
                         t.get('name') if isinstance(t, dict) and isinstance(t.get('name'), str)
                         and t['name'] in known else 'unknown' for t in tools})
-                    response = decode_agy(rows, hooks, body['model'], structured='response_schema' in body)
+                    response = decode_agy(rows, hooks, body['model'], structured='response_schema' in body,
+                                          allow_finish=agy_allow_finish)
                 elif self.endpoint == 'cli://claude':
                     if guided:  # 2.1.322's init row lists loaded plugins by name; it says nothing of their hooks
                         initial = [r for r in rows if r.get('type') == 'system' and r.get('subtype') == 'init']
@@ -1213,7 +1340,10 @@ class VendorCliClient:
                 if physical['exit_code'] != 0 and not (self.endpoint == 'cli://agy'
                         and physical.get('protocol_complete') is True and physical['exit_code'] is None):
                     raise ModelFailure('CLI_GENERATION_FAILED')
-                envelope = object_json(body['prompt'], max_bytes=self.request_byte_limit)
+                envelope = object_json(
+                    body['prompt'],
+                    max_bytes=max(self.request_byte_limit, MAX_REQUEST_BYTES) if resumed is not None else self.request_byte_limit,
+                )
                 allowed = ({a['name'] for a in envelope['action_catalog']} if 'response_schema' in body
                            else {t['name'] for t in body['native_tools']} if 'native_tools' in body
                            else {tool['function']['name'] for tool in envelope['tools']})
@@ -1230,9 +1360,40 @@ class VendorCliClient:
                 if any(c['function']['name'] not in allowed | {INVALID_CLI_REPLY}
                        for c in response['choices'][0]['message']['tool_calls']):
                     raise ModelFailure('CLI_UNEXPECTED_TOOL_PROPOSAL')
+                if self.endpoint == 'cli://agy':
+                    raw_usage = dict(response['usage']) if isinstance(response.get('usage'), dict) else None
+                    if resumed is not None:
+                        receipt['agy_resumed'] = True
+                        receipt['agy_delta_records'] = len(resumed['delta_records'])
+                        delta_usage, monotonic = _agy_usage_delta(raw_usage, resumed['cursor']['prev_usage'])
+                        if monotonic:
+                            response['usage'] = delta_usage
+                            self._agy_resume = {**resumed['cursor'], 'record_hashes': resumed['record_hashes'],
+                                                'prev_usage': raw_usage}
+                        else:
+                            self._reset_agy_resume()
+                    elif agy_allow_finish and isinstance(envelope.get('conversation_records'), list):
+                        conv_id = _agy_conversation_id(rows)
+                        if conv_id:
+                            self._agy_resume = {
+                                'conv_id': conv_id,
+                                'model': body['model'],
+                                'effort': body['effort'],
+                                'system_sha': _sha_text(body['system']),
+                                'schema_sha': _sha_text(encode(body['response_schema'])),
+                                'catalog_sha': _sha_text(encode(envelope.get('action_catalog', []))),
+                                'record_hashes': [_sha_text(encode(rec)) for rec in envelope['conversation_records']],
+                                'prev_usage': raw_usage,
+                            }
+                        else:
+                            self._reset_agy_resume()
+                    elif not self._probing and body.get('purpose') != 'summary':
+                        self._reset_agy_resume()
                 receipt.update(response_received=True, inference_invocations_observed=1, task_tools_executed=0)
                 return response, receipt
             except ModelFailure as exc:
+                if self.endpoint == 'cli://agy' and use_stable_agy:
+                    self._reset_agy_resume()
                 if getattr(exc, 'usage_limit', None) is not None:
                     receipt['usage_limit'] = exc.usage_limit
                 if isinstance(getattr(exc, 'proposed_action_count', None), int):
@@ -1242,8 +1403,12 @@ class VendorCliClient:
                 exc.transport_observation = receipt
                 raise
             except (NativeTransportInterrupted, _Unqualified):
+                if self.endpoint == 'cli://agy' and use_stable_agy:
+                    self._reset_agy_resume()
                 raise
             except Exception as exc:
+                if self.endpoint == 'cli://agy' and use_stable_agy:
+                    self._reset_agy_resume()
                 receipt['decode_error_type'] = type(exc).__name__
                 if receipt['started'] is False and isinstance(exc, OSError):
                     # The CLI could not even be launched (an update replacing it, a move): nothing was sent, so
@@ -1259,3 +1424,6 @@ class VendorCliClient:
                 failure = ModelFailure('CLI_INVALID_RESPONSE')
                 failure.transport_observation = receipt
                 raise failure from None
+        finally:
+            if ephemeral_dir is not None:
+                ephemeral_dir.cleanup()

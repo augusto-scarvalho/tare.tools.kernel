@@ -35,7 +35,7 @@ def test_agy_declares_small_batches_without_rewriting_quoted_history():
     assert agy['response_schema']['properties']['actions']['maxItems']==4
     assert claude['response_schema']['properties']['actions']['maxItems']==16
     assert json.loads(agy['prompt'])['conversation_records']==messages
-    assert '60 lines' in agy['reminder']
+    assert 'page limits' in agy['reminder']
 
 
 def test_agy_refuses_oversized_returned_batch():

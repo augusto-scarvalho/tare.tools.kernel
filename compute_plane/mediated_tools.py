@@ -86,7 +86,14 @@ SCHEMAS = {
 
 class MediatedTools:
     def __init__(self, config, *, callbacks=None, cancelled=lambda: False, before_effect=lambda: None, scratch_root=None,
-                 before_edit=None, command_mediation=None, process_factory=None, command_environment=None, command_seconds=None):
+                 before_edit=None, command_mediation=None, process_factory=None, command_environment=None, command_seconds=None,
+                 read_max_lines=200, read_max_bytes=24000):
+        if type(read_max_lines) is not int or not 1 <= read_max_lines <= 200:
+            raise ValueError('read_max_lines_must_be_1_to_200')
+        if type(read_max_bytes) is not int or not 1024 <= read_max_bytes <= 24000:
+            raise ValueError('read_max_bytes_must_be_1024_to_24000')
+        self._read_max_lines = read_max_lines
+        self._read_max_bytes = read_max_bytes
         self.config = config
         self.roots = {key: Path(root).resolve() for key, root in config["repositories"].items()}
         self.callbacks = callbacks or {}
@@ -346,17 +353,17 @@ class MediatedTools:
             column = args.get('start_column', 1)
             if type(column) is not int or column < 1:
                 raise ValueError('read_requires_valid_column: start_column is a 1-based character column')
-            line_limit = 200
+            line_limit = self._read_max_lines
             if 'json_pointer' not in args and 'limit' in args:
                 line_limit = args['limit']
-                if type(line_limit) is not int or not 1 <= line_limit <= 100 or 'end' in args:
+                if type(line_limit) is not int or not 1 <= line_limit <= min(100, self._read_max_lines) or 'end' in args:
                     raise ValueError('read_limit_requires_1_to_100_lines_without_end')
             end = args.get("end", start + line_limit - 1 if type(start) is int else None)
             if type(start) is not int or type(end) is not int or not 1 <= start <= end:
-                raise ValueError('read_requires_valid_range: start/end are inclusive integers; '
-                                 '1 <= start <= end. Pages return at most 200 lines; use next_start to continue.')
+                raise ValueError(f'read_requires_valid_range: start/end are inclusive integers; '
+                                 f'1 <= start <= end. Pages return at most {self._read_max_lines} lines; use next_start to continue.')
             requested_end = end
-            end = min(end, start + 199)
+            end = min(end, start + self._read_max_lines - 1)
             if not path.exists():
                 return {"exists": False, "sha256": None}
             with path.open('rb') as stream:
@@ -385,13 +392,13 @@ class MediatedTools:
                                  'use line numbers from search or read from start=1')
             selected, size = [], 0
             for i in range(start - 1, min(end, len(lines))):
-                if not selected and (column > 1 or len((f'{i+1}|'+lines[i]).encode()) > 24000):  # column 1 is a page
+                if not selected and (column > 1 or len((f'{i+1}|'+lines[i]).encode()) > self._read_max_bytes):  # column 1 is a page
                     if column > max(1, len(lines[i])):
                         raise ValueError('read_column_outside_line')
                     prefix = f'{i+1}|'
                     # The source is already valid UTF-8. Ignore only an incomplete
                     # codepoint at the page boundary; its column remains unread.
-                    fragment = lines[i][column-1:].encode()[:24000-len(prefix.encode())].decode('utf-8', errors='ignore')
+                    fragment = lines[i][column-1:].encode()[:self._read_max_bytes-len(prefix.encode())].decode('utf-8', errors='ignore')
                     last_column = column + len(fragment) - 1
                     unfinished = last_column < len(lines[i])
                     next_line = i+1 if unfinished else (i+2 if i+1 < len(lines) else None)
@@ -405,7 +412,7 @@ class MediatedTools:
                         **(ending if next_line is None else {})}
                 line = f'{i + 1}|{lines[i]}'
                 length = len(line.encode()) + bool(selected)
-                if size + length > 24000:
+                if size + length > self._read_max_bytes:
                     break
                 selected.append(line)
                 size += length
