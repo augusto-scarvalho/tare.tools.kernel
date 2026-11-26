@@ -215,6 +215,83 @@ def _project_old_output(name: str, raw: str) -> str:
     return encode(kept)
 
 
+def _reads_covered_later(events) -> set[str]:
+    """Effect ids of earlier succeeded line-based reads whose exact (repo, path, sha256) range is
+    100% covered by a later succeeded read of the same unchanged file in the projected window."""
+    calls, succeeded = {}, []
+    for event in events:
+        if event.get("kind") == "model_returned" and event["reply"]["tool_calls"]:
+            calls_in_reply = event["reply"]["tool_calls"]
+            head, _, tail = event["call_id"].rpartition("/model/")
+            base = f"{head}/effect/{tail}"
+            for i, call in enumerate(calls_in_reply):
+                effect = base if len(calls_in_reply) == 1 else f"{base}/{i + 1}"
+                try:
+                    args = object_json(call["arguments_json"])
+                except (ValueError, TypeError):
+                    args = {}
+                calls[effect] = (call["name"], args)
+        elif event.get("kind") == "effect_returned" and event["result"]["status"] == "succeeded":
+            succeeded.append((event["result"]["effect_id"], event["result"]["output_json"]))
+    covered: dict[tuple[str | None, str | None, str], list[tuple[int, int]]] = {}
+    duplicates: set[str] = set()
+    for effect, raw in reversed(succeeded):
+        name, args = calls.get(effect, (None, {}))
+        repo, path = args.get("repository"), args.get("path")
+        if name in _FILE_MUTATIONS:
+            mutated = {(repo, path)}
+            if name == "rename":
+                mutated.add((repo, args.get("target")))
+            for key in [k for k in covered if (k[0], k[1]) in mutated]:
+                del covered[key]
+            continue
+        if name != "read" or "json_pointer" in args:
+            continue
+        try:
+            value = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if (not isinstance(value, dict) or value.get("partial_line") or not value.get("text")
+                or not isinstance(value.get("sha256"), str) or not value["sha256"]):
+            continue
+        start, end = value.get("start"), value.get("end")
+        if type(start) is not int or type(end) is not int or start < 1 or end < start:
+            continue
+        key = (repo, path, value["sha256"])
+        spans = covered.get(key, [])
+        if any(lo <= start and end <= hi for lo, hi in spans):
+            duplicates.add(effect)
+            continue
+        merged, lo, hi, inserted = [], start, end, False
+        for a, b in spans:
+            if b + 1 < lo:
+                merged.append((a, b))
+            elif hi + 1 < a:
+                if not inserted:
+                    merged.append((lo, hi))
+                    inserted = True
+                merged.append((a, b))
+            else:
+                lo, hi = min(lo, a), max(hi, b)
+        if not inserted:
+            merged.append((lo, hi))
+        covered[key] = merged
+    return duplicates
+
+
+def _project_duplicate_read(raw: str) -> str:
+    """Keep a superseded duplicate read's range and hash, omitting redundant verbatim text."""
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError):
+        return raw
+    if not isinstance(value, dict) or "text" not in value:
+        return raw
+    kept = {k: value[k] for k in ("start", "end", "lines", "sha256", "scoped_project_instructions") if k in value}
+    kept["text_omitted"] = "Covered verbatim by a later read of the same unchanged file in this context."
+    return encode(kept)
+
+
 def _project_edited_read(raw: str) -> str:
     """Keep a stale read's position and range, not its superseded text."""
     try:
@@ -631,7 +708,8 @@ class NativeModelAdapter:
                  text_completes_turn: bool = False,
                  streaming: bool = False, on_progress=None,
                  attachment_loader=None, image_media_types=(), count_observations=(),
-                 elide_edited_reads: bool = False, elide_outputs_after: int | None = None,
+                 elide_edited_reads: bool = False, elide_duplicate_reads: bool = False,
+                 elide_outputs_after: int | None = None,
                  force_final_delivery: bool = False):
         if client.endpoint != profile.endpoint:
             raise ValueError("client endpoint must match the explicit profile")
@@ -640,8 +718,12 @@ class NativeModelAdapter:
         self.profile, self.client, self.system = profile, client, system
         if type(elide_edited_reads) is not bool:
             raise ValueError('elide_edited_reads must be a boolean')
+        if type(elide_duplicate_reads) is not bool:
+            raise ValueError('elide_duplicate_reads must be a boolean')
         # Context policy: send stale reads of later-edited files as a short marker (journal unchanged).
         self.elide_edited_reads = elide_edited_reads
+        # Context policy: elide earlier reads whose exact (path, sha256, lines) are covered by a later read.
+        self.elide_duplicate_reads = elide_duplicate_reads
         if elide_outputs_after is not None and (type(elide_outputs_after) is not int or elide_outputs_after < 1):
             raise ValueError('elide_outputs_after must be a positive integer or None')
         # Context policy: reads and searches older than this many tool replies are resent as their range or
@@ -772,6 +854,7 @@ class NativeModelAdapter:
         scoped_instructions = {}
         events = request.context.events()
         stale_reads = _reads_edited_later(events) if self.elide_edited_reads else set()
+        duplicate_reads = _reads_covered_later(events) if self.elide_duplicate_reads else set()
         old_outputs = _outputs_before(events, self.elide_outputs_after) if self.elide_outputs_after else {}
         summaries = [e for e in events if e["kind"] == "context_activated"]
         if len(summaries) > 1:
@@ -878,6 +961,8 @@ class NativeModelAdapter:
                 raw = result["output_json"]
                 if result["effect_id"] in stale_reads:
                     raw = _project_edited_read(raw)
+                elif result["effect_id"] in duplicate_reads:
+                    raw = _project_duplicate_read(raw)
                 elif result["effect_id"] in old_outputs and result["status"] == "succeeded":
                     raw = _project_old_output(old_outputs[result["effect_id"]], raw)
                 output = _project_scoped_instructions(raw, scoped_instructions)

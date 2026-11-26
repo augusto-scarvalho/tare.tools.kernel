@@ -108,7 +108,8 @@ class NativeCapabilities:
 
     def __init__(self, *, session_id, binding, repositories, writable, verifiers, scratch_root,
                  specgraph_edit_context=True, project_context=None, role='implementer', capabilities=None, review_root=None,
-                 terminal=None, scoped_instructions=False, structured_reads=False, command_mediation=None):
+                 terminal=None, scoped_instructions=False, structured_reads=False, command_mediation=None,
+                 read_max_lines=None, read_max_bytes=None):
         scratch = Path(scratch_root)
         if not scratch.is_dir() or any(p.is_symlink() or getattr(p, 'is_junction', lambda: False)()
                                       for p in (scratch, *scratch.parents)):
@@ -145,6 +146,16 @@ class NativeCapabilities:
         if type(structured_reads) is not bool:
             raise ValueError('structured_reads_boolean_required')
         self._specs = object_json(encode(TOOL_SPECS))
+        effective_read_lines = 200 if read_max_lines is None else read_max_lines
+        effective_read_bytes = 24000 if read_max_bytes is None else read_max_bytes
+        if effective_read_lines != 200 or effective_read_bytes != 24000:
+            self._specs['read']['description'] = (
+                self._specs['read']['description']
+                .replace('Pages contain at most 200 lines and 24000 bytes',
+                         f'Pages contain at most {effective_read_lines} lines and {effective_read_bytes} bytes')
+                .replace('Omit end for a page of up to 200 lines from start.',
+                         f'Omit end for a page of up to {effective_read_lines} lines from start.')
+            )
         if structured_reads:
             read = self._specs['read']
             read['description'] += (
@@ -177,7 +188,8 @@ class NativeCapabilities:
             'specgraph_edit_context': specgraph_edit_context}))
         self._tools = MediatedTools(config, cancelled=lambda: self._control is None or self._control.should_stop(),
             before_effect=self._before_effect, scratch_root=scratch, before_edit=self._before_edit,
-            command_mediation=CallbackCommandMediation(self.mediate_command) if command_mediation is not None else None)
+            command_mediation=CallbackCommandMediation(self.mediate_command) if command_mediation is not None else None,
+            read_max_lines=effective_read_lines, read_max_bytes=effective_read_bytes)
         from .native_effect_recovery import EffectReceipts
         self._receipts = EffectReceipts(scratch, session_id, config)
         self._request = None
