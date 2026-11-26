@@ -120,6 +120,113 @@ def test_agy_delta_resume_subtracts_cumulative_usage_bypasses_full_160k_cap_and_
     assert resp3['usage']['input_tokens'] == 4000
 
 
+def test_agy_resumed_summary_preserves_schema_bypasses_160k_cap_resets_cursor_and_refuses_actions(
+        tmp_path, monkeypatch):
+    calls = []
+    agent_systems = []
+    physical = dict(started=True, cleanup_verified=True, exit_code=0,
+                    cancelled=False, timeout=False, output_limit=False)
+    cum_usage = [
+        {'input_tokens': 12000, 'cache_read_tokens': 0, 'output_tokens': 80, 'thinking_tokens': 20, 'total_tokens': 12080},
+        {'input_tokens': 13200, 'cache_read_tokens': 11500, 'output_tokens': 220, 'thinking_tokens': 50, 'total_tokens': 13420},
+        {'input_tokens': 5000, 'cache_read_tokens': 0, 'output_tokens': 60, 'thinking_tokens': 10, 'total_tokens': 5060},
+    ]
+    proposals = [
+        {'text': 'turn-1', 'actions': []},
+        {'text': 'Compact summary checkpoint.', 'actions': []},
+        {'text': 'post-compaction', 'actions': []},
+    ]
+    turn = {'n': 0}
+
+    def process(argv, **options):
+        if argv[-1] == '--version':
+            return physical, b'1.5.18', b''
+        if argv[-1] == '--help':
+            switches = ' '.join(sorted(native_cli.CLI_SWITCHES['cli://agy'] | {'--resume'}))
+            return physical, switches.encode(), b''
+        idx = turn['n']
+        turn['n'] += 1
+        agent_md = (options['cwd'] / '.agents/agents/tare-inference/agent.md').read_text(encoding='utf-8')
+        agent_systems.append(agent_md)
+        calls.append((argv, json.loads(options['stdin'].decode('utf-8'))))
+        proposal = proposals[idx]
+        hooks = [
+            {'phase': 'pre', 'model': 'fixture'},
+            {'phase': 'tool', 'model': 'fixture', 'tool': 'finish', 'decision': 'allow', 'proposal': proposal},
+            {'phase': 'post', 'model': 'fixture'},
+            {'phase': 'stop', 'model': 'fixture', 'termination': 'TERMINAL_CUSTOM_HOOK'},
+        ]
+        (options['cwd'] / 'boundary.jsonl').write_text('\n'.join(json.dumps(h) for h in hooks), encoding='utf-8')
+        conv_id = 'conv-sum-1' if idx < 2 else 'conv-sum-2'
+        row = {'event': 'result', 'conversation_id': conv_id,
+               'result': {'status': 'SUCCESS', 'response': json.dumps(proposal), 'usage': cum_usage[idx]}}
+        return physical, json.dumps(row).encode(), b''
+
+    monkeypatch.setattr(native_cli, 'run_pipe_process', process)
+    client = native_cli.VendorCliClient(
+        'cli://agy', executable=str(tmp_path / 'agy.exe'), version='1.5.18',
+        qualification=AnyQualified(), request_byte_limit=160 * 1024,
+    )
+    tools = [{'function': {'name': 'read', 'parameters': {'type': 'object'}}}]
+    sys_msg = {'role': 'system', 'content': 'Original role instructions.'}
+    big_init = {'role': 'user', 'content': 'A' * (110 * 1024)}
+
+    # Turn 1: establishes conv-sum-1
+    body1 = native_cli.cli_request({'model': 'fixture', 'messages': [sys_msg, big_init], 'tools': tools}, structured=True)
+    resp1, rec1 = client.post_observed('/inference', body1, execution())
+    assert '--resume' not in calls[0][0] and resp1['usage']['input_tokens'] == 12000
+
+    # Turn 2: compaction summary whose full payload exceeds 160 KiB resumes conv-sum-1, keeps exact Turn 1
+    # system prompt and --json-schema for prefix cache reuse, subtracts cumulative usage, and resets cursor.
+    summary_msgs = [
+        {'role': 'system', 'content': 'Current operation: summarize the supplied conversation for continuation.'},
+        big_init,
+        {'role': 'user', 'content': 'B' * (70 * 1024)},
+        {'role': 'user', 'content': 'Summarize the earlier task history as a concise continuation checkpoint.'},
+    ]
+    summary_body = native_cli.cli_request(
+        {'model': 'fixture', 'messages': summary_msgs, 'tools': []}, structured=True)
+    summary_body['purpose'] = 'summary'
+    assert len(encode(summary_body).encode('utf-8')) > 160 * 1024
+    resp2, rec2 = client.post_observed('/inference', summary_body, execution())
+    assert '--resume' in calls[1][0] and calls[1][0][calls[1][0].index('--resume') + 1] == 'conv-sum-1'
+    schema1 = calls[0][0][calls[0][0].index('--json-schema') + 1]
+    schema2 = calls[1][0][calls[1][0].index('--json-schema') + 1]
+    assert schema2 == schema1 and agent_systems[1] == agent_systems[0]
+    sent2 = json.loads(calls[1][1]['message']['content'])
+    assert sent2['continuation_of_earlier_records'] is True
+    assert sent2['operation'] == 'summarize_conversation_for_continuation'
+    assert 'concise continuation checkpoint' in sent2['summary_request']
+    assert rec2['agy_resumed'] is True and rec2['agy_resumed_summary'] is True
+    assert resp2['choices'][0]['message']['content'] == 'Compact summary checkpoint.'
+    assert resp2['usage'] == {
+        'input_tokens': 1200, 'cache_read_tokens': 11500, 'output_tokens': 140,
+        'thinking_tokens': 30, 'total_tokens': 1340,
+    }
+    assert client._agy_resume is None
+
+    # Turn 3: post-compaction turn starts fresh stateless conversation.
+    body3 = native_cli.cli_request(
+        {'model': 'fixture', 'messages': [sys_msg, {'role': 'user', 'content': 'Derived history summary'}], 'tools': tools},
+        structured=True)
+    resp3, rec3 = client.post_observed('/inference', body3, execution())
+    assert '--resume' not in calls[2][0] and rec3.get('agy_resumed') is None
+
+    # Stray action emitted during a resumed summary is still refused fail-closed.
+    proposals.append({'text': '', 'actions': [{'name': 'read', 'arguments_json': '{}'}]})
+    cum_usage.append({'input_tokens': 6000, 'cache_read_tokens': 4500, 'output_tokens': 90, 'thinking_tokens': 15, 'total_tokens': 6090})
+    bad_summary = native_cli.cli_request(
+        {'model': 'fixture', 'messages': [
+            {'role': 'system', 'content': 'Current operation: summarize.'},
+            {'role': 'user', 'content': 'Derived history summary'},
+            {'role': 'user', 'content': 'Summarize now.'},
+        ], 'tools': []}, structured=True)
+    bad_summary['purpose'] = 'summary'
+    with pytest.raises(ModelFailure, match='CLI_UNEXPECTED_TOOL_PROPOSAL'):
+        client.post_observed('/inference', bad_summary, execution())
+    assert client._agy_resume is None
+
+
 def test_mechanical_read_bounds_clamp_pages_and_update_schema(tmp_path):
     repo = tmp_path / 'repo'
     repo.mkdir()

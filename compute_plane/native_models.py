@@ -1081,7 +1081,10 @@ class NativeModelAdapter:
                     # Every other Claude decision uses native tool calls captured by Tare's hook:
                     # the toolless JSON and StructuredOutput protocols made Sonnet write tool markup.
                     return cli_request(wire, summary=request.purpose == 'summary', native=request.purpose != 'summary')
-                return cli_request(wire, structured=True, native_arguments=self.profile.endpoint == 'cli://codex')
+                body = cli_request(wire, structured=True, native_arguments=self.profile.endpoint == 'cli://codex')
+                if request.purpose == 'summary' and self.profile.endpoint == 'cli://agy':
+                    body['purpose'] = 'summary'
+                return body
             return wire
         system = [{"text": system_text}]
         if self.profile.cache_system:
