@@ -911,10 +911,11 @@ class VendorCliClient:
         self._reset_agy_resume()
 
     def _agy_resume_plan(self, body):
-        """Return delta-resume plan when body strictly appends to the live AGY conversation cursor, else None."""
+        """Return delta-resume plan when body appends to (or summarizes) the live AGY conversation cursor, else None."""
         cursor = self._agy_resume
-        if (cursor is None or self.endpoint != 'cli://agy' or 'response_schema' not in body
-                or body.get('purpose') == 'summary' or self._probing):
+        if (cursor is None or self.endpoint != 'cli://agy' or 'response_schema' not in body or self._probing):
+            return None
+        if body.get('model') != cursor['model'] or body.get('effort') != cursor['effort']:
             return None
         try:
             envelope = object_json(body['prompt'], max_bytes=MAX_REQUEST_BYTES)
@@ -923,12 +924,39 @@ class VendorCliClient:
         records = envelope.get('conversation_records')
         if not isinstance(records, list):
             return None
-        if (body.get('model') != cursor['model'] or body.get('effort') != cursor['effort']
-                or _sha_text(body['system']) != cursor['system_sha']
+        prev_hashes = cursor['record_hashes']
+        if body.get('purpose') == 'summary':
+            if (envelope.get('action_catalog') != [] or len(prev_hashes) < 2 or len(records) < 3
+                    or records[0].get('role') != 'system' or records[-1].get('role') != 'user'):
+                return None
+            mid_hashes = [_sha_text(encode(rec)) for rec in records[1:-1]]
+            if not mid_hashes or mid_hashes[0] != prev_hashes[1]:
+                return None
+            cursor_tail = prev_hashes[1:]
+            matched = 0
+            for a, b in zip(mid_hashes, cursor_tail):
+                if a != b:
+                    break
+                matched += 1
+            extra_records = records[1 + matched : -1]
+            delta_obj = {
+                'continuation_of_earlier_records': True,
+                'operation': 'summarize_conversation_for_continuation',
+                'system_instruction': records[0].get('content', ''),
+                'summary_request': records[-1].get('content', ''),
+                'output_requirement': (
+                    'Return the plain-text summary in the "text" field and set "actions" to [] '
+                    '(empty array; do not call or propose any tools or delivery).'
+                ),
+            }
+            if extra_records:
+                delta_obj['additional_records_to_include'] = extra_records
+            return {'cursor': cursor, 'envelope': envelope, 'record_hashes': prev_hashes,
+                    'delta_records': extra_records, 'delta_prompt': encode(delta_obj), 'is_summary': True}
+        if (_sha_text(body['system']) != cursor['system_sha']
                 or _sha_text(encode(body['response_schema'])) != cursor['schema_sha']
                 or _sha_text(encode(envelope.get('action_catalog', []))) != cursor['catalog_sha']):
             return None
-        prev_hashes = cursor['record_hashes']
         if len(records) <= len(prev_hashes):
             return None
         cur_hashes = [_sha_text(encode(rec)) for rec in records]
@@ -939,7 +967,7 @@ class VendorCliClient:
         if 'turn_constraints' in envelope:
             delta_obj['turn_constraints'] = envelope['turn_constraints']
         return {'cursor': cursor, 'envelope': envelope, 'record_hashes': cur_hashes,
-                'delta_records': delta_records, 'delta_prompt': encode(delta_obj)}
+                'delta_records': delta_records, 'delta_prompt': encode(delta_obj), 'is_summary': False}
 
     def post(self, path, body, control):
         return self.post_observed(path, body, control)[0]
@@ -1044,7 +1072,15 @@ class VendorCliClient:
         if control.should_stop():
             raise NativeTransportInterrupted('CLI_CANCELLED', receipt)
         resumed = self._agy_resume_plan(body)
-        wire_body = {**body, 'prompt': resumed['delta_prompt']} if resumed is not None else body
+        if resumed is not None and resumed['is_summary']:
+            # Preserve the live conversation's exact system prompt and response_schema so AGY's prefix cache hits.
+            wire_body = {**body, 'system': resumed['cursor']['system'],
+                         'response_schema': resumed['cursor']['response_schema'],
+                         'reminder': '', 'prompt': resumed['delta_prompt']}
+        elif resumed is not None:
+            wire_body = {**body, 'prompt': resumed['delta_prompt']}
+        else:
+            wire_body = body
         request_bytes = len(encode(wire_body).encode('utf-8'))
         receipt.update(request_bytes=request_bytes, request_byte_limit=self.request_byte_limit)
         if request_bytes > self.request_byte_limit:
@@ -1055,7 +1091,8 @@ class VendorCliClient:
             raise failure
         timeout = min(self.timeout_seconds, control.remaining_seconds())
         use_stable_agy = (self.endpoint == 'cli://agy' and 'response_schema' in body
-                          and body.get('purpose') != 'summary' and not self._probing)
+                          and not self._probing
+                          and (body.get('purpose') != 'summary' or resumed is not None))
         if use_stable_agy and resumed is None:
             self._reset_agy_resume()
         ephemeral_dir = None if use_stable_agy else tempfile.TemporaryDirectory(prefix='tare-inference-')
@@ -1146,9 +1183,11 @@ class VendorCliClient:
                                 'request_byte_limit': self.request_byte_limit}
                             raise failure
                     agy_allow_finish = bool(agy_can_resume and 'response_schema' in body
-                                            and body.get('purpose') != 'summary' and not self._probing)
+                                            and not self._probing
+                                            and (body.get('purpose') != 'summary' or resumed is not None))
+                    invoke_body = wire_body if (resumed is not None and resumed['is_summary']) else body
                     argv, source = agy_invocation(
-                        self.executable, root, body, timeout,
+                        self.executable, root, invoke_body, timeout,
                         resume_id=resumed['cursor']['conv_id'] if resumed is not None else None,
                         delta_prompt=resumed['delta_prompt'] if resumed is not None else None,
                         allow_finish=agy_allow_finish,
@@ -1365,13 +1404,16 @@ class VendorCliClient:
                     if resumed is not None:
                         receipt['agy_resumed'] = True
                         receipt['agy_delta_records'] = len(resumed['delta_records'])
+                        if resumed['is_summary']:
+                            receipt['agy_resumed_summary'] = True
                         delta_usage, monotonic = _agy_usage_delta(raw_usage, resumed['cursor']['prev_usage'])
                         if monotonic:
                             response['usage'] = delta_usage
+                        if resumed['is_summary'] or not monotonic:
+                            self._reset_agy_resume()
+                        else:
                             self._agy_resume = {**resumed['cursor'], 'record_hashes': resumed['record_hashes'],
                                                 'prev_usage': raw_usage}
-                        else:
-                            self._reset_agy_resume()
                     elif agy_allow_finish and isinstance(envelope.get('conversation_records'), list):
                         conv_id = _agy_conversation_id(rows)
                         if conv_id:
@@ -1379,7 +1421,9 @@ class VendorCliClient:
                                 'conv_id': conv_id,
                                 'model': body['model'],
                                 'effort': body['effort'],
+                                'system': body['system'],
                                 'system_sha': _sha_text(body['system']),
+                                'response_schema': body['response_schema'],
                                 'schema_sha': _sha_text(encode(body['response_schema'])),
                                 'catalog_sha': _sha_text(encode(envelope.get('action_catalog', []))),
                                 'record_hashes': [_sha_text(encode(rec)) for rec in envelope['conversation_records']],
