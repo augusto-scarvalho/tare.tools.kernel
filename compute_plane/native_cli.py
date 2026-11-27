@@ -106,6 +106,10 @@ AGY_SONNET_GUIDANCE = (
 AGY_REQUEST_BYTE_LIMIT = 160 * 1024
 AGY_MAX_ACTIONS = 4
 _AGY_USAGE_INT_KEYS = ('input_tokens', 'output_tokens', 'thinking_tokens', 'cache_read_tokens', 'total_tokens')
+_CODEX_USAGE_INT_KEYS = (
+    'input_tokens', 'cached_input_tokens', 'cache_write_input_tokens',
+    'output_tokens', 'reasoning_output_tokens',
+)
 
 
 def _sha_text(text: str) -> str:
@@ -122,18 +126,50 @@ def _agy_conversation_id(rows) -> str | None:
     return None
 
 
-def _agy_usage_delta(current, previous):
-    """Subtract cumulative AGY conversation usage to obtain the current turn's exclusive usage."""
+def _codex_thread_id(rows) -> str | None:
+    for row in rows:
+        if row.get('type') == 'thread.started' and isinstance(row.get('thread_id'), str) and row['thread_id']:
+            return row['thread_id']
+    return None
+
+
+def _cleanup_codex_thread(thread_id: str | None, env=None):
+    """Best-effort removal of a finished Codex rollout file so resumed threads leave no disk clutter."""
+    if not thread_id or not re.fullmatch(r'[A-Za-z0-9_-]{8,128}', thread_id):
+        return
+    try:
+        base = Path((env or os.environ).get('CODEX_HOME') or Path.home()/'.codex') / 'sessions'
+        if not base.is_dir():
+            return
+        for path in base.rglob(f'*{thread_id}*.jsonl'):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _usage_delta(current, previous, keys):
+    """Subtract cumulative CLI thread usage to obtain the current turn's exclusive usage."""
     if not isinstance(current, dict) or not isinstance(previous, dict):
         return current, False
     delta = dict(current)
-    for key in _AGY_USAGE_INT_KEYS:
+    for key in keys:
         cur_val, prev_val = current.get(key), previous.get(key)
         if type(cur_val) is int and type(prev_val) is int:
             if cur_val < prev_val:
                 return current, False
             delta[key] = cur_val - prev_val
     return delta, True
+
+
+def _agy_usage_delta(current, previous):
+    return _usage_delta(current, previous, _AGY_USAGE_INT_KEYS)
+
+
+def _codex_usage_delta(current, previous):
+    return _usage_delta(current, previous, _CODEX_USAGE_INT_KEYS)
 
 # How each vendor CLI says its account has no usage left (Claude Code, Codex, AGY), read only on failure paths.
 USAGE_LIMIT_TEXT = re.compile(r"hit your (?:usage )?limit|usage limit (?:reached|exceeded)|exhausted your quota"
@@ -881,10 +917,21 @@ class VendorCliClient:
         self.qualification = {} if qualification is None else qualification
         self._probing, self._passed = set(), set()  # _passed: this session's verdicts, whatever the store
         self._codex_features = {}
+        self._codex_resume = None  # Ephemeral per-client delta cursor; journal.jsonl remains source of truth.
+        self._codex_resume_supported = {}
+        self._codex_resume_finalizer = None
         self._agy_resume = None  # Ephemeral per-client delta cursor; journal.jsonl remains source of truth.
         self._agy_resume_supported = {}
         self._agy_tempdir = None
         self._agy_tempdir_finalizer = None
+
+    def _reset_codex_resume(self, env=None):
+        cursor, self._codex_resume = self._codex_resume, None
+        fin, self._codex_resume_finalizer = self._codex_resume_finalizer, None
+        if fin is not None:
+            fin.detach()
+        if cursor is not None:
+            _cleanup_codex_thread(cursor.get('thread_id'), env)
 
     def _reset_agy_resume(self):
         self._agy_resume = None
@@ -909,6 +956,89 @@ class VendorCliClient:
 
     def close(self):
         self._reset_agy_resume()
+        self._reset_codex_resume()
+
+    def _codex_resume_plan(self, body):
+        """Return delta-resume plan when body appends to (or summarizes) the live Codex thread cursor, else None."""
+        cursor = self._codex_resume
+        if cursor is None or self.endpoint != 'cli://codex' or self._probing:
+            return None
+        if body.get('model') != cursor['model'] or body.get('effort') != cursor['effort']:
+            return None
+        try:
+            envelope = object_json(body['prompt'], max_bytes=MAX_REQUEST_BYTES)
+        except (ValueError, TypeError, KeyError, ConversationRejected):
+            return None
+        prev_hashes = cursor['record_hashes']
+        if body.get('purpose') == 'summary':
+            records = envelope.get('conversation_records')
+            if not isinstance(records, list):
+                records = envelope.get('messages')
+            if (not isinstance(records, list) or len(prev_hashes) < 2 or len(records) < 3
+                    or records[0].get('role') != 'system' or records[-1].get('role') != 'user'):
+                return None
+            # Normalize historical records identically to object_arguments_request before hashing.
+            norm = []
+            for rec in records[1:-1]:
+                item = json.loads(encode(rec))
+                if item.get('role') == 'tool' and isinstance(item.get('content'), str):
+                    try:
+                        item['content'] = object_json(item['content'])
+                    except (ValueError, ConversationRejected):
+                        pass
+                if item.get('role') == 'assistant':
+                    for call in item.get('tool_calls', []):
+                        fn = call.get('function', {})
+                        if isinstance(fn.get('arguments'), str):
+                            try:
+                                fn['arguments'] = object_json(fn['arguments'])
+                            except (ValueError, ConversationRejected):
+                                pass
+                norm.append(item)
+            mid_hashes = [_sha_text(encode(rec)) for rec in norm]
+            if not mid_hashes or mid_hashes[0] != prev_hashes[1]:
+                return None
+            cursor_tail = prev_hashes[1:]
+            matched = 0
+            for a, b in zip(mid_hashes, cursor_tail):
+                if a != b:
+                    break
+                matched += 1
+            extra_records = norm[matched:]
+            delta_obj = {
+                'continuation_of_earlier_records': True,
+                'operation': 'summarize_conversation_for_continuation',
+                'system_instruction': records[0].get('content', ''),
+                'summary_request': records[-1].get('content', ''),
+                'output_requirement': (
+                    'Return the plain-text summary in the "text" field and set "actions" to [] '
+                    '(empty array; do not call or propose any tools or delivery).'
+                ),
+            }
+            if extra_records:
+                delta_obj['additional_records_to_include'] = extra_records
+            return {'cursor': cursor, 'envelope': envelope, 'record_hashes': prev_hashes,
+                    'delta_records': extra_records, 'delta_prompt': encode(delta_obj), 'is_summary': True}
+        if 'response_schema' not in body:
+            return None
+        records = envelope.get('conversation_records')
+        if not isinstance(records, list):
+            return None
+        if (_sha_text(body['system']) != cursor['system_sha']
+                or _sha_text(encode(body['response_schema'])) != cursor['schema_sha']
+                or _sha_text(encode(envelope.get('action_catalog', []))) != cursor['catalog_sha']):
+            return None
+        if len(records) <= len(prev_hashes):
+            return None
+        cur_hashes = [_sha_text(encode(rec)) for rec in records]
+        if cur_hashes[:len(prev_hashes)] != prev_hashes:
+            return None
+        delta_records = records[len(prev_hashes):]
+        delta_obj = {'continuation_of_earlier_records': True, 'new_conversation_records': delta_records}
+        if 'turn_constraints' in envelope:
+            delta_obj['turn_constraints'] = envelope['turn_constraints']
+        return {'cursor': cursor, 'envelope': envelope, 'record_hashes': cur_hashes,
+                'delta_records': delta_records, 'delta_prompt': encode(delta_obj), 'is_summary': False}
 
     def _agy_resume_plan(self, body):
         """Return delta-resume plan when body appends to (or summarizes) the live AGY conversation cursor, else None."""
@@ -1072,13 +1202,15 @@ class VendorCliClient:
         if control.should_stop():
             raise NativeTransportInterrupted('CLI_CANCELLED', receipt)
         resumed = self._agy_resume_plan(body)
-        if resumed is not None and resumed['is_summary']:
-            # Preserve the live conversation's exact system prompt and response_schema so AGY's prefix cache hits.
-            wire_body = {**body, 'system': resumed['cursor']['system'],
-                         'response_schema': resumed['cursor']['response_schema'],
-                         'reminder': '', 'prompt': resumed['delta_prompt']}
-        elif resumed is not None:
-            wire_body = {**body, 'prompt': resumed['delta_prompt']}
+        codex_resumed = self._codex_resume_plan(body)
+        active_resumed = resumed if resumed is not None else codex_resumed
+        if active_resumed is not None and active_resumed['is_summary']:
+            # Preserve the live conversation's exact system prompt and response_schema so prefix cache hits.
+            wire_body = {**body, 'system': active_resumed['cursor']['system'],
+                         'response_schema': active_resumed['cursor']['response_schema'],
+                         'reminder': '', 'prompt': active_resumed['delta_prompt']}
+        elif active_resumed is not None:
+            wire_body = {**body, 'prompt': active_resumed['delta_prompt']}
         else:
             wire_body = body
         request_bytes = len(encode(wire_body).encode('utf-8'))
@@ -1095,7 +1227,11 @@ class VendorCliClient:
                           and (body.get('purpose') != 'summary' or resumed is not None))
         if use_stable_agy and resumed is None:
             self._reset_agy_resume()
+        if self.endpoint == 'cli://codex' and not self._probing and codex_resumed is None:
+            self._reset_codex_resume()
         ephemeral_dir = None if use_stable_agy else tempfile.TemporaryDirectory(prefix='tare-inference-')
+        started_codex_tid = None
+        env = None
         try:
             root = self._agy_stable_root() if use_stable_agy else Path(ephemeral_dir.name)
             try:
@@ -1137,7 +1273,8 @@ class VendorCliClient:
                     probe, help_raw, help_errors = run_pipe_process([self.executable, *help_args], cwd=root,
                         timeout=min(10, control.remaining_seconds()), cancelled=control.should_stop,
                         max_output=128*1024)
-                    switches = set(re.findall(r'--[a-z][a-z-]*', (help_raw + b'\n' + help_errors).decode('utf-8')))
+                    help_text = (help_raw + b'\n' + help_errors).decode('utf-8')
+                    switches = set(re.findall(r'--[a-z][a-z-]*', help_text))
                     # The owner's Claude choices travel as a mod: without --plugin-dir they cannot be applied.
                     required = CLI_SWITCHES[self.endpoint] | (
                         {'--plugin-dir'} if guided and self.endpoint == 'cli://claude' else set())
@@ -1154,6 +1291,8 @@ class VendorCliClient:
                         raise ModelFailure('CLI_CAPABILITY_UNAVAILABLE', not_started=True)
                     if self.endpoint == 'cli://agy':
                         self._agy_resume_supported[actual] = '--resume' in switches
+                    elif self.endpoint == 'cli://codex':
+                        self._codex_resume_supported[actual] = bool(re.search(r'(?m)^\s+resume\b', help_text))
                     self._checked_versions.add(actual)
                 key = actual + ' ' + str(body.get('model'))  # per release and model: one model's slip is not all
                 record = self.qualification.get(key) if actual not in self._reference else {'status': 'ok'}
@@ -1170,6 +1309,8 @@ class VendorCliClient:
                     receipt['cli_feature_count'] = len(self._codex_features[actual])
                 env = cli_env()
                 agy_allow_finish = False
+                codex_stateful = False
+                started_codex_tid = None
                 if self.endpoint == 'cli://agy':
                     agy_can_resume = bool(self._agy_resume_supported.get(actual, False))
                     if resumed is not None and not agy_can_resume:
@@ -1211,10 +1352,28 @@ class VendorCliClient:
                         if self._codex_guidance[actual]:
                             receipt['vendor_guidance']['unproved'] = self._codex_guidance[actual]
                             raise ModelFailure('CLI_GUIDANCE_UNSUPPORTED', not_started=True)
-                    argv = [self.executable, *prepare(root, body, self.model_catalog,
-                                                    features=self._codex_features[actual],
-                                                    guidance=self.vendor_guidance)]
-                    source = body['prompt']
+                    codex_can_resume = bool(self._codex_resume_supported.get(actual, False) and not self._probing)
+                    if codex_resumed is not None and not codex_can_resume:
+                        self._reset_codex_resume(env)
+                        codex_resumed = None
+                        full_bytes = len(encode(body).encode('utf-8'))
+                        receipt['request_bytes'] = full_bytes
+                        if full_bytes > self.request_byte_limit:
+                            failure = ModelFailure('REQUEST_BYTE_LIMIT_EXCEEDED', not_started=True)
+                            failure.transport_observation = {**receipt, 'request_bytes': full_bytes,
+                                'request_byte_limit': self.request_byte_limit}
+                            raise failure
+                    codex_stateful = bool(codex_can_resume and ('response_schema' in body
+                                          or (codex_resumed is not None and codex_resumed['is_summary'])))
+                    invoke_body = wire_body if (codex_resumed is not None and codex_resumed['is_summary']) else body
+                    argv = [self.executable, *prepare(
+                        root, invoke_body, self.model_catalog,
+                        features=self._codex_features[actual],
+                        guidance=self.vendor_guidance,
+                        ephemeral=not codex_stateful,
+                        resume_id=codex_resumed['cursor']['thread_id'] if codex_resumed is not None else None,
+                    )]
+                    source = codex_resumed['delta_prompt'] if codex_resumed is not None else body['prompt']
                 try:
                     completion = (AgyCompletion(root, body['model'], 'response_schema' in body,
                                                 allow_finish=agy_allow_finish)
@@ -1234,6 +1393,10 @@ class VendorCliClient:
                     raise NativeTransportInterrupted('CLI_CLEANUP_UNCONFIRMED', receipt) from None
                 receipt.update(physical, remote_stop='unknown' if physical['started'] else 'not_dispatched')
                 receipt.update(stdin_bytes=len(source.encode('utf-8')),stdout_bytes=len(raw),stderr_bytes=len(errors))
+                if self.endpoint == 'cli://codex' and codex_stateful and codex_resumed is None and raw:
+                    m_tid = re.search(rb'"thread_id"\s*:\s*"([A-Za-z0-9_-]{8,128})"', raw)
+                    if m_tid:
+                        started_codex_tid = m_tid.group(1).decode('ascii')
                 silent = silence is not None and physical.get('stalled') is True and physical['cleanup_verified']
                 if silent:  # the sample's idle_ms counts CPU as work; the reason is stdout's silence
                     receipt.update(idle_ms=silence.idle_ms, silence_seconds=self.silence_seconds)
@@ -1366,13 +1529,23 @@ class VendorCliClient:
                         receipt['provider_error'] = next(m for m in failures if isinstance(m, str))[:300]
                     from .native_cli_codex import decode, reconnect_notice
                     receipt['transport_reconnect_warnings'] = sum(reconnect_notice(row) for row in rows)
-                    catalog = object_json(body['prompt'], max_bytes=self.request_byte_limit)
-                    arguments = ({a['name']: a['input_schema'] for a in catalog['action_catalog']}
-                                 if catalog.get('argument_encoding') in {
-                                     'native-json-object/1','native-json-object/2','native-json-object/3',
-                                     'native-json-object/4'} else None)
-                    response = decode(rows, body['model'], structured='response_schema' in body,
-                                      argument_schemas=arguments, argument_encoding=catalog.get('argument_encoding'),
+                    catalog = object_json(
+                        body['prompt'],
+                        max_bytes=max(self.request_byte_limit, MAX_REQUEST_BYTES) if codex_resumed is not None else self.request_byte_limit,
+                    )
+                    if codex_resumed is not None and codex_resumed['is_summary']:
+                        arguments = codex_resumed['cursor']['argument_schemas']
+                        arg_encoding = codex_resumed['cursor']['argument_encoding']
+                        decode_structured = True
+                    else:
+                        arguments = ({a['name']: a['input_schema'] for a in catalog['action_catalog']}
+                                     if catalog.get('argument_encoding') in {
+                                         'native-json-object/1','native-json-object/2','native-json-object/3',
+                                         'native-json-object/4'} else None)
+                        arg_encoding = catalog.get('argument_encoding')
+                        decode_structured = 'response_schema' in body
+                    response = decode(rows, body['model'], structured=decode_structured,
+                                      argument_schemas=arguments, argument_encoding=arg_encoding,
                                       conversation_records=catalog.get('conversation_records', []))
                     if '_proposal_rejection' in response:
                         receipt['proposal_rejection'] = response['_proposal_rejection']
@@ -1381,11 +1554,11 @@ class VendorCliClient:
                     raise ModelFailure('CLI_GENERATION_FAILED')
                 envelope = object_json(
                     body['prompt'],
-                    max_bytes=max(self.request_byte_limit, MAX_REQUEST_BYTES) if resumed is not None else self.request_byte_limit,
+                    max_bytes=max(self.request_byte_limit, MAX_REQUEST_BYTES) if (resumed is not None or codex_resumed is not None) else self.request_byte_limit,
                 )
-                allowed = ({a['name'] for a in envelope['action_catalog']} if 'response_schema' in body
+                allowed = ({a['name'] for a in envelope['action_catalog']} if 'action_catalog' in envelope
                            else {t['name'] for t in body['native_tools']} if 'native_tools' in body
-                           else {tool['function']['name'] for tool in envelope['tools']})
+                           else {tool['function']['name'] for tool in envelope.get('tools', [])})
                 required = envelope.get('turn_constraints', {}).get('required_action')
                 calls = response['choices'][0]['message']['tool_calls']
                 if required is not None and (len(calls) != 1 or calls[0]['function']['name'] != required):
@@ -1433,11 +1606,57 @@ class VendorCliClient:
                             self._reset_agy_resume()
                     elif not self._probing and body.get('purpose') != 'summary':
                         self._reset_agy_resume()
+                elif self.endpoint == 'cli://codex':
+                    raw_usage = dict(response['usage']) if isinstance(response.get('usage'), dict) else None
+                    if codex_resumed is not None:
+                        receipt['codex_resumed'] = True
+                        receipt['codex_delta_records'] = len(codex_resumed['delta_records'])
+                        if codex_resumed['is_summary']:
+                            receipt['codex_resumed_summary'] = True
+                        delta_usage, monotonic = _codex_usage_delta(raw_usage, codex_resumed['cursor']['prev_usage'])
+                        if monotonic:
+                            response['usage'] = delta_usage
+                        if codex_resumed['is_summary'] or not monotonic or '_proposal_rejection' in response:
+                            self._reset_codex_resume(env)
+                        else:
+                            self._codex_resume = {**codex_resumed['cursor'], 'record_hashes': codex_resumed['record_hashes'],
+                                                  'prev_usage': raw_usage}
+                    elif codex_stateful and '_proposal_rejection' not in response and isinstance(envelope.get('conversation_records'), list):
+                        tid = _codex_thread_id(rows)
+                        if tid:
+                            self._reset_codex_resume(env)
+                            self._codex_resume = {
+                                'thread_id': tid,
+                                'model': body['model'],
+                                'effort': body['effort'],
+                                'system': body['system'],
+                                'system_sha': _sha_text(body['system']),
+                                'response_schema': body['response_schema'],
+                                'schema_sha': _sha_text(encode(body['response_schema'])),
+                                'catalog_sha': _sha_text(encode(envelope.get('action_catalog', []))),
+                                'argument_schemas': arguments,
+                                'argument_encoding': arg_encoding,
+                                'record_hashes': [_sha_text(encode(rec)) for rec in envelope['conversation_records']],
+                                'prev_usage': raw_usage,
+                            }
+                            self._codex_resume_finalizer = weakref.finalize(self, _cleanup_codex_thread, tid, dict(env))
+                            started_codex_tid = None
+                        else:
+                            self._reset_codex_resume(env)
+                            _cleanup_codex_thread(started_codex_tid, env)
+                    elif not self._probing and body.get('purpose') != 'summary':
+                        self._reset_codex_resume(env)
+                        _cleanup_codex_thread(started_codex_tid, env)
+                    elif started_codex_tid:
+                        _cleanup_codex_thread(started_codex_tid, env)
                 receipt.update(response_received=True, inference_invocations_observed=1, task_tools_executed=0)
                 return response, receipt
             except ModelFailure as exc:
                 if self.endpoint == 'cli://agy' and use_stable_agy:
                     self._reset_agy_resume()
+                if self.endpoint == 'cli://codex' and not self._probing:
+                    self._reset_codex_resume()
+                    _cleanup_codex_thread(started_codex_tid)
                 if getattr(exc, 'usage_limit', None) is not None:
                     receipt['usage_limit'] = exc.usage_limit
                 if isinstance(getattr(exc, 'proposed_action_count', None), int):
@@ -1449,10 +1668,16 @@ class VendorCliClient:
             except (NativeTransportInterrupted, _Unqualified):
                 if self.endpoint == 'cli://agy' and use_stable_agy:
                     self._reset_agy_resume()
+                if self.endpoint == 'cli://codex' and not self._probing:
+                    self._reset_codex_resume()
+                    _cleanup_codex_thread(started_codex_tid)
                 raise
             except Exception as exc:
                 if self.endpoint == 'cli://agy' and use_stable_agy:
                     self._reset_agy_resume()
+                if self.endpoint == 'cli://codex' and not self._probing:
+                    self._reset_codex_resume()
+                    _cleanup_codex_thread(started_codex_tid)
                 receipt['decode_error_type'] = type(exc).__name__
                 if receipt['started'] is False and isinstance(exc, OSError):
                     # The CLI could not even be launched (an update replacing it, a move): nothing was sent, so

@@ -125,7 +125,7 @@ def unproved_removals(executable, root, body, catalog, features, guidance, contr
     return sorted(k for k, (_, tag) in codex_switches(guidance).items() if tag not in before or tag in after)
 
 
-def prepare(root, body, catalog, *, features, guidance=None):
+def prepare(root, body, catalog, *, features, guidance=None, ephemeral=True, resume_id=None):
     model = json.loads(encode(catalog))
     if model.get('slug') != body['model']:
         raise ModelFailure('CLI_CATALOG_MODEL_MISMATCH', not_started=True)
@@ -145,8 +145,15 @@ def prepare(root, body, catalog, *, features, guidance=None):
               'model_reasoning_summary': 'auto'}
     from .vendor_guidance import codex_switches
     config.update({key: False for key, _ in codex_switches(guidance or {}).values()})  # the owner's removals
-    args = ['exec', '--ignore-user-config', '--ephemeral', '--skip-git-repo-check',
-            '--cd', str(root.parent), '--json', '-m', body['model'], '-s', 'read-only']
+    if resume_id:
+        config.update(sandbox_mode='read-only', approval_policy='never')
+        args = ['exec', 'resume', '--ignore-user-config', '--skip-git-repo-check',
+                '--json', '-m', body['model']]
+    else:
+        args = ['exec', '--ignore-user-config',
+                *(['--ephemeral'] if ephemeral else []),
+                '--skip-git-repo-check',
+                '--cd', str(root.parent), '--json', '-m', body['model'], '-s', 'read-only']
     if 'response_schema' in body:
         # Final JSON is data for Tare, never a vendor-side tool invocation.
         schema = root/'response-schema.json'
@@ -154,7 +161,8 @@ def prepare(root, body, catalog, *, features, guidance=None):
         args += ['--output-schema', str(schema)]
     for key, value in config.items():
         args.extend(['-c', key+'='+json.dumps(value)])
-    return args+feature_args(features)+['-']
+    tail = [resume_id, '-'] if resume_id else ['-']
+    return args+feature_args(features)+tail
 
 
 def codex_usage_limit(rows):

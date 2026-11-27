@@ -1082,7 +1082,7 @@ class NativeModelAdapter:
                     # the toolless JSON and StructuredOutput protocols made Sonnet write tool markup.
                     return cli_request(wire, summary=request.purpose == 'summary', native=request.purpose != 'summary')
                 body = cli_request(wire, structured=True, native_arguments=self.profile.endpoint == 'cli://codex')
-                if request.purpose == 'summary' and self.profile.endpoint == 'cli://agy':
+                if request.purpose == 'summary' and self.profile.endpoint in {'cli://agy', 'cli://codex'}:
                     body['purpose'] = 'summary'
                 return body
             return wire

@@ -12,6 +12,8 @@ import re
 import socket
 import ssl
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -19,6 +21,129 @@ from pathlib import Path
 MAX_BODY = 1024 * 1024
 MAX_REQUEST = 32 * MAX_BODY
 MAX_INPUT = 6 * MAX_REQUEST + 65536  # Escaped request plus bounded headers.
+HAPPY_EYEBALLS_DELAY = 0.25  # RFC 8305 connection attempt delay (seconds) for dual-stack fallback.
+
+
+def _interleave_addrinfo(infos):
+    """RFC 8305 section 4: alternate address families while preserving OS preference for the first family."""
+    if len(infos) <= 1:
+        return list(infos)
+    first_family = infos[0][0]
+    preferred = [info for info in infos if info[0] == first_family]
+    alternate = [info for info in infos if info[0] != first_family]
+    ordered = []
+    for pair in zip(preferred, alternate):
+        ordered.extend(pair)
+    ordered.extend(preferred[len(alternate):])
+    ordered.extend(alternate[len(preferred):])
+    return ordered
+
+
+def _happy_eyeballs_connect(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None):
+    """Connect with RFC 8305 staggered dual-stack attempts so a blackholed IPv6 path falls back to IPv4 fast."""
+    if getattr(socket.create_connection, '__module__', None) != 'socket':
+        return socket.create_connection(address, timeout, source_address)
+    host, port = address
+    infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    if not infos:
+        raise OSError('getaddrinfo returns an empty list')
+    if len(infos) == 1:
+        return socket.create_connection(address, timeout, source_address)
+    ordered = _interleave_addrinfo(infos)
+    effective_timeout = socket.getdefaulttimeout() if timeout is socket._GLOBAL_DEFAULT_TIMEOUT else timeout
+    deadline = None if effective_timeout is None else (time.monotonic() + effective_timeout)
+    lock = threading.Lock()
+    done = threading.Event()
+    winner = [None]
+    cancelled = [False]
+    errors = []
+    active = [0]
+
+    def attempt(info, launched):
+        af, socktype, proto, _, sa = info
+        sock = None
+        try:
+            sock = socket.socket(af, socktype, proto)
+            if deadline is not None:
+                rem = deadline - time.monotonic()
+                if rem <= 0:
+                    raise TimeoutError('timed out')
+                sock.settimeout(rem)
+            if source_address:
+                sock.bind(source_address)
+            launched.set()
+            sock.connect(sa)
+        except BaseException as exc:
+            launched.set()
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            with lock:
+                errors.append(exc)
+                active[0] -= 1
+                if winner[0] is None and active[0] == 0:
+                    done.set()
+            return
+        with lock:
+            if winner[0] is None and not cancelled[0]:
+                winner[0] = sock
+                done.set()
+                return
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    try:
+        for idx, info in enumerate(ordered):
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            with lock:
+                if winner[0] is not None:
+                    return winner[0]
+                active[0] += 1
+                done.clear()
+            launched = threading.Event()
+            threading.Thread(target=attempt, args=(info, launched), daemon=True).start()
+            launched.wait(0.05)
+            if idx < len(ordered) - 1:
+                wait_for = HAPPY_EYEBALLS_DELAY
+                if deadline is not None:
+                    wait_for = min(wait_for, max(0.0, deadline - time.monotonic()))
+                done.wait(wait_for)
+                with lock:
+                    if winner[0] is not None:
+                        return winner[0]
+            else:
+                while True:
+                    with lock:
+                        if winner[0] is not None:
+                            return winner[0]
+                        if active[0] == 0:
+                            break
+                        done.clear()
+                    rem = None if deadline is None else max(0.0, deadline - time.monotonic())
+                    if rem is not None and rem <= 0:
+                        break
+                    done.wait(rem)
+        with lock:
+            if winner[0] is not None:
+                return winner[0]
+            cancelled[0] = True
+            if deadline is not None and time.monotonic() >= deadline and active[0] > 0:
+                raise TimeoutError('timed out')
+            if errors:
+                for exc in errors:
+                    if isinstance(exc, ConnectionRefusedError):
+                        raise exc
+                raise errors[-1]
+        raise TimeoutError('timed out')
+    except BaseException:
+        with lock:
+            cancelled[0] = True
+        raise
 
 # Fixed diagnostics only: never echo exception text, response data or credentials.
 STREAM_REASONS = frozenset({
@@ -172,6 +297,9 @@ def main():
         # cancellation and cleanup (including a blocked resolver).
         read_timeout = request.get('read_timeout', request['timeout'])
         class TransmissionBoundary:
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._create_connection = _happy_eyeballs_connect
             def send(self, data):
                 nonlocal transmission_started, phase
                 # Connect/TLS must finish before any application bytes can leave.
