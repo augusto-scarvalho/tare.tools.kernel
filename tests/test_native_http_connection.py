@@ -201,3 +201,47 @@ def test_incomplete_worker_attestation_cannot_authorize_retry(monkeypatch, fault
     monkeypatch.setattr(managed_process, 'run_pipe_process', worker)
     with pytest.raises(NativeTransportInterrupted):
         NativeHttpClient('http://fixture').post_stream_observed('/test', {}, real_control(), protocol='openai-chat')
+
+
+def test_happy_eyeballs_interleaves_address_families():
+    from compute_plane.native_http_worker import _interleave_addrinfo
+    infos = [
+        (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('2606:4700::1', 443, 0, 0)),
+        (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('2606:4700::2', 443, 0, 0)),
+        (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('104.18.10.66', 443)),
+        (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('104.18.11.66', 443)),
+    ]
+    ordered = _interleave_addrinfo(infos)
+    assert [i[0] for i in ordered] == [socket.AF_INET6, socket.AF_INET, socket.AF_INET6, socket.AF_INET]
+    assert [i[4][0] for i in ordered] == ['2606:4700::1', '104.18.10.66', '2606:4700::2', '104.18.11.66']
+
+
+def test_happy_eyeballs_falls_back_fast_when_first_family_blackholes(monkeypatch):
+    import time
+    with endpoint('success') as (url, seen, *_):
+        port = int(url.rsplit(':', 1)[1])
+        # Simulate dual-stack DNS returning two blackholed IPv6 addresses before the live IPv4 address.
+        inject_worker(monkeypatch, f'''import socket, time
+_real_socket = socket.socket
+class _BlackholeIPv6Socket(_real_socket):
+    def connect(self, address):
+        if self.family == socket.AF_INET6:
+            time.sleep(30)
+            raise TimeoutError('blackholed ipv6')
+        return super().connect(address)
+socket.socket = _BlackholeIPv6Socket
+def _dual_stack_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return [
+        (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('2606:4700::1', {port}, 0, 0)),
+        (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('2606:4700::2', {port}, 0, 0)),
+        (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('127.0.0.1', {port})),
+    ]
+socket.getaddrinfo = _dual_stack_getaddrinfo
+''')
+        t0 = time.monotonic()
+        resp, receipt = NativeHttpClient(f'http://dual-stack.example:{port}', connect_timeout_seconds=10).post_observed(
+            '/test', {}, real_control())
+        elapsed = time.monotonic() - t0
+        assert 'choices' in resp and receipt['response_received'] is True and len(seen) == 1
+        assert elapsed < 3.0, f'Expected fast IPv4 fallback, took {elapsed:.2f}s'
+

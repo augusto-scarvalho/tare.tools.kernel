@@ -152,3 +152,148 @@ def test_codex_refuses_a_call_its_users_global_instructions_would_reach(tmp_path
     else:
         client.post_observed('', body, execution())
         assert len(sent) == 1
+
+
+def test_codex_delta_resume_subtracts_cumulative_usage_resumes_summary_and_cleans_rollout(tmp_path, monkeypatch):
+    home = tmp_path / 'codex-home'
+    sessions_dir = home / 'sessions' / '2026' / '11' / '26'
+    sessions_dir.mkdir(parents=True)
+    monkeypatch.setenv('CODEX_HOME', str(home))
+    physical = dict(started=True, cleanup_verified=True, exit_code=0,
+                    cancelled=False, timeout=False, output_limit=False)
+    cum_usage = [
+        {'input_tokens': 14000, 'cached_input_tokens': 0, 'cache_write_input_tokens': 0, 'output_tokens': 50, 'reasoning_output_tokens': 10},
+        {'input_tokens': 28500, 'cached_input_tokens': 13800, 'cache_write_input_tokens': 0, 'output_tokens': 120, 'reasoning_output_tokens': 30},
+        {'input_tokens': 43200, 'cached_input_tokens': 28100, 'cache_write_input_tokens': 0, 'output_tokens': 260, 'reasoning_output_tokens': 45},
+        {'input_tokens': 6000, 'cached_input_tokens': 0, 'cache_write_input_tokens': 0, 'output_tokens': 40, 'reasoning_output_tokens': 5},
+    ]
+    answers = [
+        {'text': 't1', 'actions': []},
+        {'text': 't2', 'actions': []},
+        {'text': 'Concise continuation summary.', 'actions': []},
+        {'text': 't4', 'actions': []},
+    ]
+    calls = []
+    turn = {'n': 0}
+
+    def process(argv, **options):
+        if '--version' in argv:
+            return physical, b'codex-cli 0.166.0', b''
+        if '--help' in argv:
+            help_body = 'Commands:\n  resume  Resume a previous session\n' + ' '.join(native_cli.CLI_SWITCHES['cli://codex'])
+            return physical, help_body.encode(), b''
+        if argv[1:3] == ['features', 'list']:
+            rows = [f'{n}  stable  {str("-c" in argv and n in ENABLED_FEATURES).lower()}' for n in sorted(REQUIRED_FEATURES)]
+            return physical, '\n'.join(rows).encode(), b''
+        idx = turn['n']
+        turn['n'] += 1
+        tid = '01a21ae6-791a-7232-b803-e574aa77c92b' if idx < 3 else '01a21ae6-791a-7232-b803-ffffffffffff'
+        rollout = sessions_dir / f'rollout-2026-11-26-{tid}.jsonl'
+        if not rollout.exists():
+            rollout.write_text('{}\n', encoding='utf-8')
+        calls.append((argv, json.loads(options['stdin'].decode('utf-8'))))
+        rows = [
+            {'type': 'thread.started', 'thread_id': tid},
+            {'type': 'turn.started'},
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': json.dumps(answers[idx])}},
+            {'type': 'turn.completed', 'usage': cum_usage[idx]},
+        ]
+        return physical, '\n'.join(json.dumps(r) for r in rows).encode(), b''
+
+    monkeypatch.setattr(native_cli, 'run_pipe_process', process)
+    client = native_cli.VendorCliClient(
+        'cli://codex', executable=str(tmp_path / 'codex.exe'), version='0.166.0',
+        model_catalog={'slug': 'fixture'}, qualification=AnyQualified(),
+    )
+    tools = [{'function': {'name': 'read', 'parameters': {'type': 'object', 'properties': {}, 'required': [], 'additionalProperties': False}}}]
+    sys_msg = {'role': 'system', 'content': 'Role guidance.'}
+    msg1 = {'role': 'user', 'content': 'Initial prompt.'}
+
+    # Turn 1: non-ephemeral exec establishes thread_id
+    body1 = native_cli.cli_request({'model': 'fixture', 'messages': [sys_msg, msg1], 'tools': tools},
+                                   structured=True, native_arguments=True)
+    resp1, rec1 = client.post_observed('', body1, execution())
+    assert '--ephemeral' not in calls[0][0] and calls[0][0][1:3] != ['exec', 'resume']
+    assert resp1['usage']['input_tokens'] == 14000 and rec1.get('codex_resumed') is None
+
+    # Turn 2: strictly appended history resumes thread_id with delta only and subtracts cumulative usage
+    delta = [{'role': 'assistant', 'content': 't1'}, {'role': 'user', 'content': 'follow-up'}]
+    body2 = native_cli.cli_request({'model': 'fixture', 'messages': [sys_msg, msg1, *delta], 'tools': tools},
+                                   structured=True, native_arguments=True)
+    resp2, rec2 = client.post_observed('', body2, execution())
+    assert calls[1][0][1:3] == ['exec', 'resume']
+    assert '01a21ae6-791a-7232-b803-e574aa77c92b' in calls[1][0]
+    assert 'sandbox_mode="read-only"' in calls[1][0]
+    assert calls[1][1]['continuation_of_earlier_records'] is True
+    assert calls[1][1]['new_conversation_records'] == delta
+    assert rec2['codex_resumed'] is True and rec2['codex_delta_records'] == 2
+    assert resp2['usage'] == {
+        'input_tokens': 14500, 'cached_input_tokens': 13800, 'cache_write_input_tokens': 0,
+        'output_tokens': 70, 'reasoning_output_tokens': 20,
+    }
+
+    # Turn 3: compaction summary through NativeModelAdapter.wire() resumes the live thread, keeps original schema,
+    # subtracts usage, and cleans rollout
+    from types import SimpleNamespace
+    from compute_plane.native_models import ModelProfile, NativeModelAdapter
+    from tare_tools_agent_runtime import ModelRequest
+    adapter = NativeModelAdapter(
+        ModelProfile(protocol='vendor-cli', endpoint='cli://codex', model='fixture',
+                     context_window=200000, output_tokens=4096, source='fixture'),
+        client, system='Role guidance.', tool_specs_json='{}',
+        counter_protocol='utf8-envelope-estimate-v1',
+    )
+    summary_ctx = SimpleNamespace(events=lambda: (
+        {'kind': 'model_returned', 'call_id': 's-codex/model/1', 'reply': {
+            'complete': True, 'text': 't1', 'tool_calls': [], 'proposes_delivery': False,
+            'metadata_json': json.dumps({'profile_digest': adapter.profile_digest,
+                                         'assistant': {'role': 'assistant', 'content': 't1'}})}},
+        {'kind': 'user_message', 'message_id': 'u2', 'text': 'follow-up'},
+    ))
+    summary_body = adapter.wire(ModelRequest(
+        session_id='s-codex', call_id='s-codex/summary/1', instruction='Initial prompt.',
+        capabilities=(), context=summary_ctx,
+        required_context=(), suffix='Write the continuation summary.', purpose='summary',
+    ))
+    assert summary_body.get('purpose') == 'summary'
+    resp3, rec3 = client.post_observed('', summary_body, execution())
+    assert calls[2][0][1:3] == ['exec', 'resume']
+    assert calls[2][1]['operation'] == 'summarize_conversation_for_continuation'
+    assert rec3['codex_resumed'] is True and rec3['codex_resumed_summary'] is True
+    assert resp3['choices'][0]['message']['content'] == 'Concise continuation summary.'
+    assert resp3['usage']['input_tokens'] == 14700 and resp3['usage']['cached_input_tokens'] == 14300
+    assert not (sessions_dir / 'rollout-2026-11-26-01a21ae6-791a-7232-b803-e574aa77c92b.jsonl').exists()
+
+    # Turn 4: post-compaction starts fresh thread; client.close() cleans its rollout
+    body4 = native_cli.cli_request({'model': 'fixture', 'messages': [sys_msg, {'role': 'user', 'content': 'Compacted.'}], 'tools': tools},
+                                   structured=True, native_arguments=True)
+    resp4, rec4 = client.post_observed('', body4, execution())
+    assert calls[3][0][1:3] != ['exec', 'resume'] and rec4.get('codex_resumed') is None
+    assert (sessions_dir / 'rollout-2026-11-26-01a21ae6-791a-7232-b803-ffffffffffff.jsonl').exists()
+    client.close()
+    assert not (sessions_dir / 'rollout-2026-11-26-01a21ae6-791a-7232-b803-ffffffffffff.jsonl').exists()
+
+    # Failed initial call after thread.started still cleans up its persisted rollout file.
+    fail_tid = '01a21ae6-791a-7232-b803-deadbeef0001'
+    fail_rollout = sessions_dir / f'rollout-2026-11-26-{fail_tid}.jsonl'
+    def fail_process(argv, **options):
+        if '--version' in argv:
+            return physical, b'codex-cli 0.166.0', b''
+        if '--help' in argv:
+            help_body = 'Commands:\n  resume  Resume a previous session\n' + ' '.join(native_cli.CLI_SWITCHES['cli://codex'])
+            return physical, help_body.encode(), b''
+        if argv[1:3] == ['features', 'list']:
+            rows = [f'{n}  stable  {str("-c" in argv and n in ENABLED_FEATURES).lower()}' for n in sorted(REQUIRED_FEATURES)]
+            return physical, '\n'.join(rows).encode(), b''
+        fail_rollout.write_text('{}\n', encoding='utf-8')
+        rows = [
+            {'type': 'thread.started', 'thread_id': fail_tid},
+            {'type': 'turn.started'},
+            {'type': 'turn.failed', 'error': {'message': 'transient error'}},
+        ]
+        return physical | {'exit_code': 1}, '\n'.join(json.dumps(r) for r in rows).encode(), b''
+    monkeypatch.setattr(native_cli, 'run_pipe_process', fail_process)
+    with pytest.raises(ModelFailure, match='CLI_GENERATION_FAILED'):
+        client.post_observed('', body4, execution())
+    assert not fail_rollout.exists()
+
