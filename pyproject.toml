@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tare-kernel"
-version = "0.9.103"
+version = "0.9.104"
 description = "Bounded model and tool execution for the tare.tools ecosystem"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -38,9 +38,6 @@ where = ["."]
 include = [
     "assurance_plane*",
     "compute_plane*",
-    "control_plane*",
-    "data_plane*",
-    "experience_plane*",
 ]
 
 [tool.setuptools.package-data]

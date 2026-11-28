@@ -58,9 +58,9 @@ jobs:
           "git+https://github.com/augusto-scarvalho/tare.tools.specgraph@${{ env.SPECGRAPH_REVISION }}"
           -e ".[dev,attachments,live-cache]"
 
-      - name: Require every plane and the SpecGraph integration (no optional skips)
+      - name: Require implemented planes and the SpecGraph integration (no optional skips)
         run: >-
-          python -c "import assurance_plane, compute_plane, control_plane, data_plane, experience_plane;
+          python -c "import assurance_plane, compute_plane;
           import specgraph.hook_context, specgraph.lifecycle; print('Kernel and pinned SpecGraph loaded')"
 
       - name: Install pinned ripgrep for the search tests

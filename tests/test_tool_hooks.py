@@ -156,9 +156,6 @@ def test_kernel_specgraph_config_covers_all_searchable_project_surfaces():
     for path in (
         "assurance_plane",
         "compute_plane",
-        "control_plane",
-        "data_plane",
-        "experience_plane",
         "scripts",
         "tests",
         "docs",

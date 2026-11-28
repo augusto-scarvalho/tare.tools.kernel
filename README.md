@@ -56,10 +56,10 @@ The implemented code lives in `compute_plane/`, plus producer receipts in `assur
 
 Limits stated plainly:
 
-- `control_plane/`, `data_plane/` and `experience_plane/` are empty placeholders
-  from the original five-plane plan ([SPEC-KERNEL-001](docs/SPEC-KERNEL-001.md)).
-  There is no SQLite WAL store, landing notary or cockpit here; landing, leases,
-  the cockpit and the TUI live in tare.tools.os.
+- Only `compute_plane/` and `assurance_plane/` are packaged here; the earlier
+  empty placeholder packages (`control_plane/`, `data_plane/`, `experience_plane/`
+  from [SPEC-KERNEL-001](docs/SPEC-KERNEL-001.md)) were retired because landing,
+  leases, the cockpit and the TUI live in tare.tools.os.
 - Project roots select working directories; they are **not a command sandbox**.
   Linked worktrees isolate Git changes; the optional confinement profiles above
   (Windows, and Linux with bubblewrap) are off unless a host injects them.
