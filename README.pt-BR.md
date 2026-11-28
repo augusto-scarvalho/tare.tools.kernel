@@ -58,10 +58,10 @@ O código implementado está em `compute_plane/`, mais os recibos de produtor em
 
 Limites, sem rodeios:
 
-- `control_plane/`, `data_plane/` e `experience_plane/` são pacotes vazios do
-  plano original de cinco planos ([SPEC-KERNEL-001](docs/SPEC-KERNEL-001.md)).
-  Não há store SQLite WAL, notário de incorporação nem cockpit aqui; incorporação,
-  leases, cockpit e TUI ficam no tare.tools.os.
+- Apenas `compute_plane/` e `assurance_plane/` são empacotados aqui; os pacotes
+  vazios anteriores (`control_plane/`, `data_plane/`, `experience_plane/` do
+  plano [SPEC-KERNEL-001](docs/SPEC-KERNEL-001.md)) foram aposentados porque
+  incorporação, leases, cockpit e TUI ficam no tare.tools.os.
 - Raízes de projeto selecionam diretórios de trabalho; **não são sandbox de comandos**.
   Worktrees vinculadas isolam mudanças Git; os perfis opcionais de confinamento
   acima (Windows, e Linux com bubblewrap) ficam desligados a menos que um host os injete.

@@ -3,9 +3,6 @@ project_name: "tare.tools.kernel"
 governed_paths:
   - assurance_plane
   - compute_plane
-  - control_plane
-  - data_plane
-  - experience_plane
   - scripts
 search_paths:
   - docs
@@ -19,11 +16,7 @@ test_paths:
   - tests
 schema_paths:
   - assurance_plane
-  - control_plane
-  - data_plane
-api_paths:
-  - control_plane
-  - experience_plane
+api_paths: []
 adr_paths: []
 excluded_paths:
   - __pycache__
